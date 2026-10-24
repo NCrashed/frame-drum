@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frame_drum/calibration_screen.dart';
+import 'package:frame_drum/dsp.dart';
 import 'package:frame_drum/editor_screen.dart';
 import 'package:frame_drum/history_screen.dart';
 import 'package:frame_drum/main.dart';
@@ -60,9 +61,9 @@ Store _sample() {
   final s = Store();
   s.settings
     ..latencyMs['speaker'] = 38
-    ..dumTone = 14
-    ..tekTone = -18
-    ..toneThreshold = -2;
+    ..strokeModel = StrokeModel([1], [-1], [1])
+    ..dumScores = [12, 18, 9, 22, 15, 7, 19, 14, 11, 16]
+    ..tekScores = [-15, -20, -9, -24, 2, -17, -12, -19, -8, -14];
   final maqsum = s.patterns[3];
   final rng = math.Random(5);
   for (var i = 0; i < 9; i++) {

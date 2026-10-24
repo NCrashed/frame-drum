@@ -7,6 +7,7 @@ import 'audio.dart';
 import 'dsp.dart';
 import 'model.dart';
 import 'pattern.dart';
+import 'recorder.dart';
 import 'scoring.dart';
 import 'synth.dart';
 
@@ -65,25 +66,32 @@ class Practice extends ChangeNotifier {
 
   Scorer? scorer;
   OnsetDetector? _detector;
-  SelfSoundGate? _gate;
+  SessionRecorder? _recorder;
   double _latency = 0;
-  int? _t0;
+  final clock = PlaybackClock();
   DateTime? _startedAt;
   double introSeconds = 0;
   int countInBeats = 4;
   Hit? lastHit;
+
+  /// Where the last debug recording was saved.
+  String? recordedTo;
   final _subs = <StreamSubscription<dynamic>>[];
 
   bool get running => state == PracticeState.running;
   double get levelDb => _detector?.levelDb ?? -120;
 
   /// Song time (seconds since count-in start) of what is heard right now.
-  double? get now => _t0 == null ? null : (io.now() - _t0!) / 1e9;
+  double? get now => clock.t0 == null ? null : (io.now() - clock.t0!) / 1e9;
+
+  /// Song time of a native timestamp, corrected for latency.
+  double _song(int t) => (t - clock.t0!) / 1e9 - _latency;
 
   Future<void> start() async {
     if (state != PracticeState.idle) return;
     state = PracticeState.starting;
     error = null;
+    recordedTo = null;
     notifyListeners();
     try {
       if (!await io.requestMic()) {
@@ -99,7 +107,7 @@ class Practice extends ChangeNotifier {
       final loop = synth.loop(pattern);
       introSeconds = intro.seconds(info.sampleRate);
       // With headphones the mic can't hear us, so nothing to filter.
-      _gate = route == 'speaker'
+      final gate = route == 'speaker'
           ? SelfSoundGate(
               intro: intro.events,
               loop: loop.events,
@@ -108,13 +116,39 @@ class Practice extends ChangeNotifier {
               levels: s.selfLevelDb,
             )
           : null;
-      _detector = OnsetDetector(sampleRate: info.sampleRate, riseDb: s.riseDb, minLevelDb: s.minLevelDb);
-      scorer = Scorer(pattern, start: introSeconds, lowThreshold: s.toneThreshold);
+      final sc = scorer = Scorer(pattern, start: introSeconds, lowThreshold: s.toneThreshold);
+      _detector = OnsetDetector(
+        sampleRate: info.sampleRate,
+        riseDb: s.riseDb,
+        minLevelDb: s.minLevelDb,
+        // A second stroke can't come sooner than most of the shortest gap.
+        minGapMs: (sc.window * 800).clamp(35, 120),
+        model: s.strokeModel,
+      )..ignore = gate == null ? null : (t, peak) => clock.t0 != null && gate.isSelf(_song(t), peak);
       lastHit = null;
-      _t0 = null;
+      clock
+        ..t0 = null
+        ..underruns = 0
+        ..jumps = 0;
+      _recorder = s.record
+          ? await SessionRecorder.open(_stamp(), info.sampleRate, {
+              'pattern': pattern.toJson(),
+              'route': route,
+              'latencyMs': _latency * 1000,
+              'introSeconds': introSeconds,
+              'settings': s.toJson(),
+            })
+          : null;
       await io.syncClock();
       _subs
-        ..add(io.clock.listen((t0) => _t0 = t0))
+        ..add(
+          io.clock.listen((r) {
+            _recorder?.addClock(io.now(), r);
+            final jumps = clock.jumps;
+            clock.report(r);
+            if (clock.jumps != jumps) notifyListeners();
+          }),
+        )
         ..add(io.mic.listen(_onMic));
       await io.startMic();
       await io.play(intro.pcm, loop.pcm);
@@ -129,16 +163,31 @@ class Practice extends ChangeNotifier {
     notifyListeners();
   }
 
+  static String _stamp() {
+    final d = DateTime.now();
+    String two(int x) => x.toString().padLeft(2, '0');
+    return 'session-${d.year}${two(d.month)}${two(d.day)}-${two(d.hour)}${two(d.minute)}${two(d.second)}';
+  }
+
   void _onMic(MicChunk c) {
-    final det = _detector, sc = scorer, t0 = _t0;
+    final det = _detector, sc = scorer;
     if (det == null || sc == null) return;
+    _recorder?.addChunk(c);
     final onsets = det.feed(c.pcm, c.t);
-    if (t0 == null) return;
+    if (clock.t0 == null) return;
     var changed = false;
     for (final o in onsets) {
-      final t = (o.t - t0) / 1e9 - _latency;
-      if (_gate?.isSelf(t, o.peakDb) ?? false) continue;
+      final t = _song(o.t);
       final h = sc.addHit(t, o.toneDb, o.peakDb);
+      _recorder?.addOnset({
+        't': o.t,
+        'song': t,
+        'peak': o.peakDb,
+        'tone': o.toneDb,
+        'features': o.features,
+        'grade': h?.grade.name,
+        'offsetMs': h == null || h.target == null ? null : h.offsetMs,
+      });
       if (h != null) {
         lastHit = h;
         changed = true;
@@ -146,7 +195,7 @@ class Practice extends ChangeNotifier {
     }
     // Onsets are reported after their measurement window, so lag behind a bit
     // before declaring a stroke missed.
-    final end = (c.t + c.pcm.length * 1e9 ~/ det.sampleRate - t0) / 1e9 - _latency;
+    final end = _song(c.t + c.pcm.length * 1000000000 ~/ det.sampleRate);
     if (sc.advance(end - 0.08).isNotEmpty) changed = true;
     if (changed) notifyListeners();
   }
@@ -169,6 +218,12 @@ class Practice extends ChangeNotifier {
         silent: pattern.silentCycles > 0 ? TallySummary.of(sc.silent) : null,
       );
       store.addSession(session);
+    }
+    final rec = _recorder;
+    _recorder = null;
+    if (rec != null) {
+      await rec.close({'underruns': clock.underruns, 'clockJumps': clock.jumps});
+      recordedTo = rec.wav.path;
     }
     notifyListeners();
     return session;

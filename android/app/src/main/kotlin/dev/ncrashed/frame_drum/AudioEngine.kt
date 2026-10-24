@@ -11,6 +11,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import io.flutter.plugin.common.EventChannel
 
 /**
@@ -21,7 +22,8 @@ import io.flutter.plugin.common.EventChannel
  *
  * Events sent to [sink]:
  *  - {"type": "mic", "t": Long, "pcm": FloatArray}: t is the capture time of pcm[0].
- *  - {"type": "clock", "t0": Long}: the time frame 0 of the intro leaves the speaker.
+ *  - {"type": "clock", "t0": Long, "underruns": Int}: the time frame 0 of the intro
+ *    leaves the speaker, and how many times playback has run dry so far.
  */
 class AudioEngine(context: Context) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -54,7 +56,10 @@ class AudioEngine(context: Context) {
     fun startMic() {
         if (micRunning) return
         micRunning = true
-        micThread = Thread({ micLoop() }, "mic").apply {
+        micThread = Thread({
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            micLoop()
+        }, "mic").apply {
             priority = Thread.MAX_PRIORITY
             start()
         }
@@ -129,7 +134,10 @@ class AudioEngine(context: Context) {
         stopPlay()
         if (loop.isEmpty()) return
         playRunning = true
-        playThread = Thread({ playLoop(intro, loop) }, "play").apply {
+        playThread = Thread({
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            playLoop(intro, loop)
+        }, "play").apply {
             priority = Thread.MAX_PRIORITY
             start()
         }
@@ -157,8 +165,9 @@ class AudioEngine(context: Context) {
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(minBuf * 2)
-            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            // Large buffer: latency is measured by timestamps anyway, while a
+            // buffer that runs dry shifts every following click.
+            .setBufferSizeInBytes(maxOf(minBuf * 2, sampleRate / 5 * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
@@ -181,7 +190,7 @@ class AudioEngine(context: Context) {
                 if (now - lastClock > 250_000_000L && track.getTimestamp(ts) && ts.framePosition > 0) {
                     lastClock = now
                     val t0 = ts.nanoTime - ts.framePosition * 1_000_000_000L / sampleRate
-                    emit(mapOf("type" to "clock", "t0" to t0))
+                    emit(mapOf("type" to "clock", "t0" to t0, "underruns" to track.underrunCount))
                 }
             }
         } finally {

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'dsp.dart';
 import 'pattern.dart';
 import 'scoring.dart';
 import 'synth.dart';
@@ -113,41 +114,55 @@ class Settings {
   /// ignore them when practising without headphones.
   Map<Voice, double> selfLevelDb = {};
 
-  /// Tone (low minus high band, dB) separating dum from rim strokes.
-  double toneThreshold = 0;
-  double? dumTone, tekTone;
+  /// Dum-versus-rim classifier trained on the player's drum.
+  StrokeModel? strokeModel;
 
-  /// Detector sensitivity.
-  double riseDb = 12;
-  double minLevelDb = -50;
+  /// Leave-one-out scores of the training strokes, for the calibration chart.
+  List<double> dumScores = [], tekScores = [];
+
+  /// Score boundary between dum and rim strokes (0 is the model's own).
+  double toneThreshold = 0;
+
+  /// Detector sensitivity: attack threshold and quietest stroke.
+  double riseDb = 9;
+  double minLevelDb = -55;
+
+  /// Write the mic signal of each session to a WAV file for debugging.
+  bool record = false;
 
   double clickVolume = 0.6;
   double guideVolume = 0.7;
 
-  bool get toneCalibrated => dumTone != null && tekTone != null;
+  bool get toneCalibrated => strokeModel != null;
 
   Map<String, dynamic> toJson() => {
     'latency': latencyMs,
     'self': {for (final e in selfLevelDb.entries) e.key.name: e.value},
+    'model': strokeModel?.toJson(),
+    'dumScores': dumScores,
+    'tekScores': tekScores,
     'tone': toneThreshold,
-    'dum': dumTone,
-    'tek': tekTone,
-    'rise': riseDb,
-    'min': minLevelDb,
+    // Keys changed with the band-based detector, so old values are not reused.
+    'rise2': riseDb,
+    'min2': minLevelDb,
+    'record': record,
     'click': clickVolume,
     'guide': guideVolume,
   };
 
   void fromJson(Map<String, dynamic> j) {
+    List<double> nums(Object? x) => (x as List? ?? []).map((v) => (v as num).toDouble()).toList();
     latencyMs = (j['latency'] as Map? ?? {}).map((k, v) => MapEntry(k as String, (v as num).toDouble()));
     selfLevelDb = {
       for (final e in (j['self'] as Map? ?? {}).entries) ?Voice.values.asNameMap()[e.key]: (e.value as num).toDouble(),
     };
-    toneThreshold = (j['tone'] as num?)?.toDouble() ?? 0;
-    dumTone = (j['dum'] as num?)?.toDouble();
-    tekTone = (j['tek'] as num?)?.toDouble();
-    riseDb = (j['rise'] as num?)?.toDouble() ?? 12;
-    minLevelDb = (j['min'] as num?)?.toDouble() ?? -50;
+    strokeModel = StrokeModel.fromJson(j['model']);
+    dumScores = nums(j['dumScores']);
+    tekScores = nums(j['tekScores']);
+    toneThreshold = strokeModel == null ? 0 : (j['tone'] as num?)?.toDouble() ?? 0;
+    riseDb = (j['rise2'] as num?)?.toDouble() ?? 9;
+    minLevelDb = (j['min2'] as num?)?.toDouble() ?? -55;
+    record = j['record'] as bool? ?? false;
     clickVolume = (j['click'] as num?)?.toDouble() ?? 0.6;
     guideVolume = (j['guide'] as num?)?.toDouble() ?? 0.7;
   }

@@ -20,7 +20,12 @@ class MainActivity : FlutterActivity() {
         val audio = AudioEngine(this).also { engine = it }
 
         MethodChannel(messenger, "frame_drum/storage").setMethodCallHandler { call, result ->
-            if (call.method == "filesDir") result.success(filesDir.absolutePath) else result.notImplemented()
+            when (call.method) {
+                "filesDir" -> result.success(filesDir.absolutePath)
+                // Reachable over adb (/sdcard/Android/data/...): debug recordings go here.
+                "externalDir" -> result.success(getExternalFilesDir(null)?.absolutePath)
+                else -> result.notImplemented()
+            }
         }
 
         EventChannel(messenger, "frame_drum/events").setStreamHandler(object : EventChannel.StreamHandler {

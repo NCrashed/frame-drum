@@ -10,9 +10,10 @@ import 'practice.dart';
 import 'synth.dart';
 import 'theme.dart';
 
-enum _Mode { listen, dum, tek, loopback, playAlong }
+enum _Mode { listen, strokes, loopback, playAlong }
 
-const _samplesPerStroke = 8;
+/// Strokes recorded for the dum/tek model, alternating and starting with dum.
+const _trainStrokes = 20;
 
 class CalibrationScreen extends StatefulWidget {
   const CalibrationScreen({super.key, required this.store});
@@ -31,16 +32,17 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
   String? error;
   OnsetDetector? det;
   StreamSubscription<MicChunk>? _micSub;
-  StreamSubscription<int>? _clockSub;
+  StreamSubscription<ClockReport>? _clockSub;
   late final Ticker _ticker;
   final _level = ValueNotifier(-120.0);
 
   _Mode mode = _Mode.listen;
   Onset? last;
-  final dumTones = <double>[], tekTones = <double>[];
+  final _train = <Onset>[];
+  String? strokeNote;
 
   // Latency test.
-  int? _t0;
+  final _clock = PlaybackClock();
   Rendered? _test;
   double _testIntro = 0;
   final _testOnsets = <Onset>[];
@@ -65,7 +67,7 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       route = info.route;
       _rebuildDetector();
       _micSub = io.mic.listen(_onMic);
-      _clockSub = io.clock.listen((t) => _t0 = t);
+      _clockSub = io.clock.listen(_clock.report);
       await io.startMic();
       await io.keepScreenOn(true);
       if (mounted) setState(() {});
@@ -74,7 +76,8 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
     }
   }
 
-  void _rebuildDetector() => det = OnsetDetector(sampleRate: sampleRate, riseDb: s.riseDb, minLevelDb: s.minLevelDb);
+  void _rebuildDetector() =>
+      det = OnsetDetector(sampleRate: sampleRate, riseDb: s.riseDb, minLevelDb: s.minLevelDb, model: s.strokeModel);
 
   @override
   void dispose() {
@@ -95,12 +98,9 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       switch (mode) {
         case _Mode.listen:
           break;
-        case _Mode.dum:
-          dumTones.add(o.toneDb);
-          if (dumTones.length >= _samplesPerStroke) _finishTone();
-        case _Mode.tek:
-          tekTones.add(o.toneDb);
-          if (tekTones.length >= _samplesPerStroke) _finishTone();
+        case _Mode.strokes:
+          _train.add(o);
+          if (_train.length >= _trainStrokes) _fitStrokes();
         case _Mode.loopback || _Mode.playAlong:
           _testOnsets.add(o);
       }
@@ -108,18 +108,29 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
     }
   }
 
-  void _collect(_Mode m) {
-    setState(() {
-      mode = m;
-      (m == _Mode.dum ? dumTones : tekTones).clear();
-    });
-  }
+  void _startStrokes() => setState(() {
+    mode = _Mode.strokes;
+    strokeNote = null;
+    _train.clear();
+  });
 
-  void _finishTone() {
-    if (mode == _Mode.dum) s.dumTone = median(dumTones);
-    if (mode == _Mode.tek) s.tekTone = median(tekTones);
+  void _fitStrokes() {
     mode = _Mode.listen;
-    if (s.dumTone != null && s.tekTone != null) s.toneThreshold = (s.dumTone! + s.tekTone!) / 2;
+    final dums = [for (var i = 0; i < _train.length; i += 2) _train[i].features];
+    final teks = [for (var i = 1; i < _train.length; i += 2) _train[i].features];
+    final (sd, st) = StrokeModel.crossValidate(dums, teks);
+    final right = sd.where((x) => x >= 0).length + st.where((x) => x < 0).length;
+    s
+      ..strokeModel = StrokeModel.fit(dums, teks)
+      ..dumScores = sd
+      ..tekScores = st
+      ..toneThreshold = 0;
+    final share = right / (sd.length + st.length);
+    strokeNote = share >= 0.9
+        ? 'Узнаёт ${pct(share)} ударов. Сыграйте ещё немного и посмотрите на подписи ниже.'
+        : 'Узнаёт только ${pct(share)}. Попробуйте заново: строго по очереди, начиная с дума, '
+              'без лишних касаний. Если не помогает, играйте дум ближе к центру.';
+    _rebuildDetector();
     widget.store.save();
   }
 
@@ -143,7 +154,10 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       latencyNote = null;
       _test = test;
       _testOnsets.clear();
-      _t0 = null;
+      _clock
+        ..t0 = null
+        ..underruns = 0
+        ..jumps = 0;
     });
     await io.play(test.pcm, silence(sampleRate));
     _testTimer = Timer(Duration(milliseconds: (test.seconds(sampleRate) * 1000).round() + 600), _finishLatency);
@@ -151,11 +165,18 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
 
   void _finishLatency() {
     io.stopPlay();
-    final test = _test!, t0 = _t0;
+    final test = _test!, t0 = _clock.t0;
     final wasLoopback = mode == _Mode.loopback;
     mode = _Mode.listen;
     if (t0 == null) {
       setState(() => latencyNote = 'Не удалось получить время воспроизведения, попробуйте ещё раз');
+      return;
+    }
+    if (_clock.jumps > 0) {
+      setState(
+        () => latencyNote =
+            'Звук прерывался во время измерения (${_clock.jumps} раз), результат не сохранён. Попробуйте ещё раз.',
+      );
       return;
     }
     final times = [for (final o in _testOnsets) (o.t - t0) / 1e9];
@@ -173,7 +194,7 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       if (clicks.length < 6) {
         setState(
           () => latencyNote =
-              'Микрофон услышал ${clicks.length} щелчков из 10. Прибавьте громкость или поднимите чувствительность.',
+              'Микрофон услышал ${clicks.length} щелчков из 10. Прибавьте громкость или снизьте порог атаки.',
         );
         return;
       }
@@ -203,6 +224,7 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
   @override
   Widget build(BuildContext context) {
     final busy = mode != _Mode.listen;
+    final testing = mode == _Mode.loopback || mode == _Mode.playAlong;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Калибровка', style: TextStyle(fontWeight: FontWeight.w600)),
@@ -219,30 +241,37 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
             title: '1. Микрофон',
             body:
                 'Положите телефон в 1–2 м от бубна микрофоном к нему. Ударьте несколько раз: каждый удар '
-                'должен давать одну отметку. Если удары теряются, поднимите чувствительность; если '
-                'срабатывает на шум, опустите.',
+                'должен давать ровно одну отметку. Если удары теряются, снизьте порог атаки; если '
+                'один удар даёт несколько отметок, поднимите его.',
             children: [
               ValueListenableBuilder(
                 valueListenable: _level,
                 builder: (_, v, _) => _Meter(levelDb: v, floorDb: s.minLevelDb),
               ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  const Text('Чувствительность', style: TextStyle(color: Palette.muted)),
-                  Expanded(
-                    child: Slider(
-                      min: -75,
-                      max: -20,
-                      value: -s.minLevelDb - 95,
-                      onChanged: (v) => setState(() {
-                        s.minLevelDb = -v - 95;
-                        _rebuildDetector();
-                      }),
-                      onChangeEnd: (_) => widget.store.save(),
-                    ),
-                  ),
-                ],
+              const SizedBox(height: 4),
+              _SliderRow(
+                label: 'Порог атаки',
+                value: s.riseDb,
+                min: 4,
+                max: 20,
+                text: '${s.riseDb.round()} дБ',
+                onChanged: (v) => setState(() {
+                  s.riseDb = v.roundToDouble();
+                  _rebuildDetector();
+                }),
+                onChangeEnd: widget.store.save,
+              ),
+              _SliderRow(
+                label: 'Тише не слушать',
+                value: s.minLevelDb,
+                min: -75,
+                max: -25,
+                text: '${s.minLevelDb.round()} дБ',
+                onChanged: (v) => setState(() {
+                  s.minLevelDb = v.roundToDouble();
+                  _rebuildDetector();
+                }),
+                onChangeEnd: widget.store.save,
               ),
               _LastHit(onset: last, threshold: s.toneThreshold, calibrated: s.toneCalibrated),
             ],
@@ -251,33 +280,33 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
           _Section(
             title: '2. Дум и тек',
             body:
-                'Сыграйте $_samplesPerStroke ударов каждого вида, как обычно играете, с паузами. '
-                'Приложение запомнит, чем они отличаются по звуку.',
+                'Сыграйте $_trainStrokes ударов строго по очереди: дум, тек, дум, тек… начиная с дума, в '
+                'спокойном темпе, как обычно играете. Приложение научится различать их именно на вашем '
+                'бубне, в том числе когда тек звучит поверх звона дума.',
             children: [
-              _ToneChart(dum: dumTones, tek: tekTones, settings: s),
-              const SizedBox(height: 8),
-              Row(
+              _ToneChart(dum: s.dumScores, tek: s.tekScores, threshold: s.toneThreshold),
+              const SizedBox(height: 4),
+              const Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Expanded(
-                    child: _CollectButton(
-                      label: 'Дум',
-                      active: mode == _Mode.dum,
-                      count: dumTones.length,
-                      done: s.dumTone != null,
-                      onPressed: busy ? null : () => _collect(_Mode.dum),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _CollectButton(
-                      label: 'Тек',
-                      active: mode == _Mode.tek,
-                      count: tekTones.length,
-                      done: s.tekTone != null,
-                      onPressed: busy ? null : () => _collect(_Mode.tek),
-                    ),
-                  ),
+                  Text('← тек', style: TextStyle(color: Palette.rim, fontSize: 12)),
+                  Text('дум →', style: TextStyle(color: Palette.brass, fontSize: 12)),
                 ],
+              ),
+              if (strokeNote != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(strokeNote!, style: const TextStyle(color: Palette.muted)),
+                ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: busy || det == null ? null : _startStrokes,
+                icon: Icon(mode == _Mode.strokes ? Icons.mic : Icons.fiber_manual_record_outlined),
+                label: Text(
+                  mode == _Mode.strokes
+                      ? 'Сейчас ${_train.length.isEven ? 'дум' : 'тек'}: ${_train.length} из $_trainStrokes'
+                      : (s.toneCalibrated ? 'Записать заново' : 'Записать'),
+                ),
               ),
             ],
           ),
@@ -309,10 +338,26 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
               ),
               FilledButton.icon(
                 onPressed: busy || det == null ? null : _startLatency,
-                icon: Icon(
-                  mode == _Mode.loopback || mode == _Mode.playAlong ? Icons.hourglass_top : Icons.timer_outlined,
-                ),
-                label: Text(mode == _Mode.loopback || mode == _Mode.playAlong ? 'Идёт измерение…' : 'Измерить'),
+                icon: Icon(testing ? Icons.hourglass_top : Icons.timer_outlined),
+                label: Text(testing ? 'Идёт измерение…' : 'Измерить'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _Section(
+            title: 'Отладка',
+            body:
+                'Сохранять звук с микрофона каждого занятия в WAV вместе с тем, что распознало приложение. '
+                'Файлы лежат в Android/data/dev.ncrashed.frame_drum/files, их можно забрать через adb pull.',
+            children: [
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Записывать занятия'),
+                value: s.record,
+                onChanged: (v) {
+                  s.record = v;
+                  widget.store.save();
+                },
               ),
             ],
           ),
@@ -348,6 +393,49 @@ class _Section extends StatelessWidget {
         ],
       ),
     ),
+  );
+}
+
+class _SliderRow extends StatelessWidget {
+  const _SliderRow({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.text,
+    required this.onChanged,
+    required this.onChangeEnd,
+  });
+  final String label, text;
+  final double value, min, max;
+  final ValueChanged<double> onChanged;
+  final VoidCallback onChangeEnd;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    children: [
+      SizedBox(
+        width: 120,
+        child: Text(label, style: const TextStyle(color: Palette.muted)),
+      ),
+      Expanded(
+        child: Slider(
+          min: min,
+          max: max,
+          value: value.clamp(min, max),
+          onChanged: onChanged,
+          onChangeEnd: (_) => onChangeEnd(),
+        ),
+      ),
+      SizedBox(
+        width: 56,
+        child: Text(
+          text,
+          textAlign: TextAlign.right,
+          style: const TextStyle(fontFeatures: tabular),
+        ),
+      ),
+    ],
   );
 }
 
@@ -401,13 +489,13 @@ class _LastHit extends StatelessWidget {
             text: 'Последний удар: ',
             style: TextStyle(color: Palette.muted),
           ),
-          if (calibrated)
-            TextSpan(
-              text: low ? 'дум ' : 'тек ',
-              style: TextStyle(color: low ? Palette.brass : Palette.rim, fontWeight: FontWeight.w600),
-            ),
           TextSpan(
-            text: '(${o.peakDb.round()} дБ, тембр ${o.toneDb.round()})',
+            text: low ? 'дум ' : 'тек ',
+            style: TextStyle(color: low ? Palette.brass : Palette.rim, fontWeight: FontWeight.w600),
+          ),
+          TextSpan(
+            text:
+                '(${o.peakDb.round()} дБ${calibrated ? ', уверенность ${o.toneDb.abs().round()}' : ', без калибровки'})',
             style: const TextStyle(color: Palette.muted, fontFeatures: tabular),
           ),
         ],
@@ -416,55 +504,34 @@ class _LastHit extends StatelessWidget {
   }
 }
 
-class _CollectButton extends StatelessWidget {
-  const _CollectButton({
-    required this.label,
-    required this.active,
-    required this.count,
-    required this.done,
-    required this.onPressed,
-  });
-  final String label;
-  final bool active, done;
-  final int count;
-  final VoidCallback? onPressed;
-
-  @override
-  Widget build(BuildContext context) => OutlinedButton.icon(
-    onPressed: active ? null : onPressed,
-    icon: Icon(active ? Icons.mic : (done ? Icons.check : Icons.fiber_manual_record_outlined)),
-    label: Text(active ? '$label: $count из $_samplesPerStroke' : (done ? '$label: заново' : '$label: записать')),
-  );
-}
-
-/// Tone of recorded strokes on one axis, with the dum/tek boundary.
+/// Leave-one-out scores of the training strokes on one axis, with the boundary.
 class _ToneChart extends StatelessWidget {
-  const _ToneChart({required this.dum, required this.tek, required this.settings});
+  const _ToneChart({required this.dum, required this.tek, required this.threshold});
   final List<double> dum, tek;
-  final Settings settings;
+  final double threshold;
 
   @override
   Widget build(BuildContext context) => SizedBox(
     height: 44,
-    child: CustomPaint(size: Size.infinite, painter: _TonePainter(dum, tek, settings)),
+    child: CustomPaint(size: Size.infinite, painter: _TonePainter(dum, tek, threshold)),
   );
 }
 
 class _TonePainter extends CustomPainter {
-  _TonePainter(this.dum, this.tek, this.s);
+  _TonePainter(this.dum, this.tek, this.threshold);
   final List<double> dum, tek;
-  final Settings s;
+  final double threshold;
 
   @override
   void paint(Canvas canvas, Size size) {
-    const lo = -40.0, hi = 40.0;
+    const lo = -30.0, hi = 30.0;
     double x(double v) => 6 + (v.clamp(lo, hi) - lo) / (hi - lo) * (size.width - 12);
     final mid = size.height / 2;
     canvas.drawLine(Offset(0, mid), Offset(size.width, mid), Paint()..color = Palette.line);
-    if (s.toneCalibrated) {
+    if (dum.isNotEmpty || tek.isNotEmpty) {
       canvas.drawLine(
-        Offset(x(s.toneThreshold), 2),
-        Offset(x(s.toneThreshold), size.height - 2),
+        Offset(x(threshold), 2),
+        Offset(x(threshold), size.height - 2),
         Paint()
           ..color = Palette.text
           ..strokeWidth = 2,
@@ -475,17 +542,6 @@ class _TonePainter extends CustomPainter {
     }
     for (final v in dum) {
       canvas.drawCircle(Offset(x(v), mid + 8), 5, Paint()..color = Palette.brass.withValues(alpha: 0.8));
-    }
-    for (final (v, c, dy) in [(s.tekTone, Palette.rim, -8.0), (s.dumTone, Palette.brass, 8.0)]) {
-      if (v == null) continue;
-      canvas.drawCircle(
-        Offset(x(v), mid + dy),
-        8,
-        Paint()
-          ..color = c
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2,
-      );
     }
   }
 

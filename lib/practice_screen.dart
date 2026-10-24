@@ -64,10 +64,14 @@ class _PracticeScreenState extends State<PracticeScreen> with SingleTickerProvid
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
+        duration: Duration(seconds: practice.recordedTo == null ? 4 : 10),
         content: Text(
-          s == null
-              ? 'Слишком коротко, сессия не сохранена'
-              : 'Сохранено: точность ${pct(s.sound.accuracy)}, разброс ${ms(s.sound.sdMs)}',
+          [
+            s == null
+                ? 'Слишком коротко, сессия не сохранена'
+                : 'Сохранено: точность ${pct(s.sound.accuracy)}, разброс ${ms(s.sound.sdMs)}',
+            if (practice.recordedTo != null) 'Запись: ${practice.recordedTo}',
+          ].join('\n'),
         ),
       ),
     );
@@ -112,6 +116,15 @@ class _PracticeScreenState extends State<PracticeScreen> with SingleTickerProvid
                 OffsetStrip(scorer: practice.scorer),
                 const SizedBox(height: 12),
                 _Stats(practice: practice),
+                if (practice.clock.jumps > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      'Звук прерывался или сдвигался ${practice.clock.jumps} раз '
+                      '(обрывов буфера: ${practice.clock.underruns}). Сдвиги учтены в подсчёте.',
+                      style: const TextStyle(color: Palette.off, fontSize: 13),
+                    ),
+                  ),
                 const SizedBox(height: 16),
                 if (practice.error != null)
                   Padding(

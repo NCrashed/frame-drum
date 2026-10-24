@@ -3,17 +3,19 @@ import 'dart:typed_data';
 
 /// A detected drum hit.
 class Onset {
-  Onset({required this.t, required this.peakDb, required this.toneDb});
+  Onset({required this.t, required this.peakDb, required this.features, this.toneDb = 0});
 
   /// Capture time in the native clock, nanoseconds.
   final int t;
 
-  /// Loudest hop energy after the attack, dBFS.
+  /// Loudest broadband hop level around the attack, dBFS.
   final double peakDb;
 
-  /// Low-band minus high-band energy right after the attack, dB. Positive for
-  /// a dum (centre of the head), negative for rim strokes.
-  final double toneDb;
+  /// Spectral description of the stroke (see [OnsetDetector]).
+  final List<double> features;
+
+  /// Dum-versus-rim score: positive means dum. Set by a [StrokeModel].
+  double toneDb;
 
   bool isLow(double threshold) => toneDb >= threshold;
 
@@ -50,52 +52,103 @@ class Biquad {
 
 double toDb(double power) => 10 * math.log(power + 1e-12) / math.ln10;
 
-/// Streaming onset detector tuned for hand drums.
+/// Octave band edges, Hz.
+const bandEdges = [40.0, 90.0, 180.0, 360.0, 720.0, 1440.0, 2880.0, 5760.0, 11500.0];
+
+/// Streaming onset detector for a large frame drum.
 ///
-/// Works on 64-sample hops (~1.3 ms at 48 kHz). An onset starts when the hop
-/// energy jumps [riseDb] above the quietest hop of the preceding ~15 ms and is
-/// above [minLevelDb]. Then for [measureMs] it collects the peak level and the
-/// low/high band balance used to tell dum from tek. A louder event inside that
-/// window that rises [riseDb] from the decay of the first one (e.g. a drum hit
-/// right after a metronome click) closes the current onset and starts a new one.
+/// The signal is split into 8 octave bands and handled in 64-sample hops
+/// (~1.3 ms at 48 kHz). A big drum keeps ringing in the low bands for a long
+/// time and its modes beat, so loudness alone gives false and late onsets.
+/// Instead the detection function is the weighted average of the rise of
+/// each band's level over a few milliseconds; upper bands, where every stroke
+/// has a sharp attack and nothing rings for long, weigh the most.
+///
+/// The attack time is then refined on the raw upper-band energy: the first hop
+/// reaching a quarter of the attack peak.
+///
+/// Each onset carries features for [StrokeModel]: per band, how much the level
+/// rose against the 20 ms before the stroke (so leftover ringing of the
+/// previous dum doesn't count), and the spectral shape right after it.
 class OnsetDetector {
-  OnsetDetector({required this.sampleRate, this.riseDb = 12, this.minLevelDb = -50, this.measureMs = 35})
-    : _hp = Biquad.highPass(40, sampleRate.toDouble()),
-      _lowA = Biquad.lowPass(250, sampleRate.toDouble()),
-      _lowB = Biquad.lowPass(250, sampleRate.toDouble()),
-      _highA = Biquad.highPass(1500, sampleRate.toDouble()),
-      _highB = Biquad.highPass(1500, sampleRate.toDouble());
+  OnsetDetector({required this.sampleRate, this.riseDb = 9, this.minLevelDb = -55, this.minGapMs = 45, this.model})
+    : _hp = Biquad.highPass(30, sampleRate.toDouble()) {
+    final sr = sampleRate.toDouble();
+    for (var b = 0; b < bandCount; b++) {
+      final hi = math.min(bandEdges[b + 1], sr * 0.45);
+      _filters.add([
+        Biquad.highPass(bandEdges[b], sr),
+        Biquad.highPass(bandEdges[b], sr),
+        Biquad.lowPass(hi, sr),
+        Biquad.lowPass(hi, sr),
+      ]);
+      // Envelope smoothing over about one and a half periods of the band's
+      // lowest frequency, so that low bands don't ripple with the waveform.
+      final tau = math.max(0.002, 1.5 / bandEdges[b]);
+      _alpha.add(1 - math.exp(-hop / (tau * sr)));
+      _lag.add(math.max(3, (tau * sr / hop).round()));
+    }
+  }
 
   final int sampleRate;
+
+  /// Detection threshold: weighted average band rise, dB.
   double riseDb;
+
+  /// Quietest broadband hop level that can be a stroke, dBFS.
   double minLevelDb;
-  final double measureMs;
+
+  /// No new stroke within this time after the previous one.
+  double minGapMs;
+
+  /// Classifier filling [Onset.toneDb]; a fixed low-minus-high rule without it.
+  StrokeModel? model;
+
+  /// Called before an onset is accepted; returning true drops it without
+  /// starting the refractory period (used to skip our own metronome clicks).
+  bool Function(int t, double peakDb)? ignore;
 
   static const hop = 64;
-  static const _ring = 24;
-  static const _baseHops = 16; // ~21 ms: longer than a period of the lowest dum partial
-  static const _skip = 2; // most recent hops left out of the baseline (attack ramp)
-  static const _smoothHops = 8;
+  static const bandCount = 8;
+  static const _weights = [0.05, 0.1, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0];
+  static const _ring = 128; // hops of history (~170 ms)
+  static const _beforeFrom = 18, _beforeTo = 3; // hops before the attack used as "before"
+  static const _afterHops = 30; // ~40 ms used as "after"
 
-  final Biquad _hp, _lowA, _lowB, _highA, _highB;
-  final _power = List<double>.filled(_ring, 1e-12); // linear hop powers
-  var _pos = 0;
-  var _warmup = _ring;
+  final Biquad _hp;
+  final _filters = <List<Biquad>>[];
+  final _alpha = <double>[];
+  final _lag = <int>[];
 
-  // Partial hop carried between feed() calls.
+  // Per hop, indexed by absolute hop number modulo _ring.
+  final _raw = List.generate(bandCount, (_) => Float64List(_ring));
+  final _env = List.generate(bandCount, (_) => Float64List(_ring)); // smoothed, dB
+  final _broad = Float64List(_ring); // dB
+  final _attack = Float64List(_ring); // raw energy above 720 Hz
+  final _hopTime = List<int>.filled(_ring, 0);
+  final _smooth = Float64List(bandCount);
+
+  var _n = 0; // hops processed
   var _fill = 0;
-  var _accE = 0.0, _accLow = 0.0, _accHigh = 0.0;
-  int? _hopStart; // native time of the current hop's first sample
+  final _acc = Float64List(bandCount);
+  var _accBroad = 0.0;
+  int? _hopStart;
 
-  // Active measurement.
-  int? _onsetT;
-  var _hopsLeft = 0;
-  var _peak = -120.0, _smoothPeak = -120.0, _dip = -120.0, _low = 0.0, _high = 0.0;
+  // Peak picking.
+  int? _candidate; // hop where the detection function crossed the threshold
+  var _candidatePeak = 0.0;
+  int _lastOnsetHop = -1 << 30;
+  double _lastOnsetStrength = 0;
 
-  /// Most recent hop level, for the input meter.
+  final _pending = <int>[]; // onset hops waiting for their "after" window
+
+  /// Most recent broadband level, for the input meter.
   double levelDb = -120;
 
-  int get _measureHops => (measureMs / 1000 * sampleRate / hop).round();
+  /// Detection function of the latest hop, for diagnostics.
+  double strength = 0;
+
+  double get _hopMs => hop * 1000 / sampleRate;
 
   /// Feeds samples whose first one was captured at native time [t] (ns).
   List<Onset> feed(Float32List pcm, int t) {
@@ -103,77 +156,206 @@ class OnsetDetector {
     final nsPerSample = 1e9 / sampleRate;
     for (var i = 0; i < pcm.length; i++) {
       final x = _hp(pcm[i]);
-      final lo = _lowB(_lowA(x)), hi = _highB(_highA(x));
       if (_fill == 0) _hopStart = t + (i * nsPerSample).round();
-      _accE += x * x;
-      _accLow += lo * lo;
-      _accHigh += hi * hi;
+      _accBroad += x * x;
+      for (var b = 0; b < bandCount; b++) {
+        final f = _filters[b];
+        final y = f[3](f[2](f[1](f[0](x))));
+        _acc[b] += y * y;
+      }
       if (++_fill == hop) {
         _hop(_hopStart!, out);
         _fill = 0;
-        _accE = _accLow = _accHigh = 0;
+        _accBroad = 0;
+        _acc.fillRange(0, bandCount, 0);
       }
     }
     return out;
   }
 
-  /// Mean power of hops [from, to) back from the current one, dB.
-  double _meanDb(int from, int to) {
-    var s = 0.0;
-    for (var k = from; k < to; k++) {
-      s += _power[(_pos - k + _ring) % _ring];
-    }
-    return toDb(s / (to - from));
-  }
+  int _at(int hopIndex) => hopIndex % _ring;
 
   void _hop(int t, List<Onset> out) {
-    final p = _accE / hop;
-    final e = toDb(p);
-    levelDb = e;
-    _pos = (_pos + 1) % _ring;
-    _power[_pos] = p;
-    // Hop energy of a low sine swings with its phase, so compare against
-    // averages rather than single hops.
-    final base = _meanDb(_skip, _skip + _baseHops);
-    final smooth = _meanDb(0, _smoothHops);
+    final n = _n++;
+    final k = _at(n);
+    _hopTime[k] = t;
+    _broad[k] = levelDb = toDb(_accBroad / hop);
+    var attack = 0.0;
+    for (var b = 0; b < bandCount; b++) {
+      final e = _acc[b] / hop;
+      _raw[b][k] = e;
+      _smooth[b] += _alpha[b] * (e - _smooth[b]);
+      _env[b][k] = toDb(_smooth[b]);
+      if (b >= 4) attack += e;
+    }
+    _attack[k] = attack;
 
-    if (_onsetT != null) {
-      // A new attack rising well above the decay (not the ramp) of the current one.
-      if (e > _peak && e - _dip >= riseDb && _dip < _smoothPeak - 3) {
-        _emit(out);
-        _start(t, e, smooth);
+    // Weighted average rise of the band envelopes (after the filters settle).
+    var d = 0.0;
+    if (n >= _ring) {
+      var w = 0.0, top = 0.0;
+      for (var b = 0; b < bandCount; b++) {
+        final rise = math.max(0.0, _env[b][k] - _env[b][_at(n - _lag[b])]);
+        d += _weights[b] * rise;
+        w += _weights[b];
+        if (b >= 5) top += rise / 3;
+      }
+      d /= w;
+      // Beating modes of the ringing membrane raise single bands; a stroke
+      // also has an attack above 1.4 kHz.
+      if (top < riseDb / 2) d = 0;
+    }
+    strength = d;
+
+    _pick(n, d);
+    _flush(n, out);
+  }
+
+  void _pick(int n, double d) {
+    final c = _candidate;
+    if (c != null) {
+      // Let the detection function reach its peak (at most ~5 ms).
+      if (d > _candidatePeak && n - c < 4) {
+        _candidatePeak = d;
         return;
       }
-      _peak = math.max(_peak, e);
-      if (smooth > _smoothPeak) {
-        _smoothPeak = _dip = smooth;
-      } else {
-        _dip = math.min(_dip, smooth);
+      _candidate = null;
+      _accept(c, n, _candidatePeak);
+      return;
+    }
+    final sinceLast = (n - _lastOnsetHop) * _hopMs;
+    if (sinceLast < minGapMs) return;
+    // Right after a loud stroke, a weak "attack" is most likely its echo or a
+    // beating mode rather than a new stroke.
+    final need = sinceLast < 150 ? math.max(riseDb, 0.35 * _lastOnsetStrength) : riseDb;
+    if (d >= need) {
+      _candidate = n;
+      _candidatePeak = d;
+    }
+  }
+
+  void _accept(int cross, int now, double strength) {
+    // Attack peak in the upper bands around the crossing.
+    final from = math.max(cross - 3, now - _ring + 1);
+    var peakHop = cross, peak = 0.0, loud = -120.0;
+    for (var h = from; h <= now; h++) {
+      if (_attack[_at(h)] > peak) {
+        peak = _attack[_at(h)];
+        peakHop = h;
       }
-      _low += _accLow;
-      _high += _accHigh;
-      if (--_hopsLeft == 0) _emit(out);
-      return;
+      loud = math.max(loud, _broad[_at(h)]);
     }
-    if (_warmup > 0) {
-      _warmup--;
-      return;
+    if (loud < minLevelDb) return;
+    var onset = peakHop;
+    for (var h = from; h <= peakHop; h++) {
+      if (_attack[_at(h)] >= peak * 0.25) {
+        onset = h;
+        break;
+      }
     }
-    if (e - base >= riseDb && e >= minLevelDb) _start(t, e, smooth);
+    if (ignore?.call(_hopTime[_at(onset)], loud) ?? false) return;
+    _lastOnsetHop = onset;
+    _lastOnsetStrength = strength;
+    _pending.add(onset);
   }
 
-  void _start(int t, double e, double smooth) {
-    _onsetT = t;
-    _hopsLeft = _measureHops;
-    _peak = e;
-    _smoothPeak = _dip = smooth;
-    _low = _accLow;
-    _high = _accHigh;
+  /// Emits pending onsets whose "after" window is complete or cut short by
+  /// the next onset.
+  void _flush(int n, List<Onset> out) {
+    while (_pending.isNotEmpty) {
+      final o = _pending.first;
+      final end = _pending.length > 1 ? math.min(_pending[1], o + _afterHops) : o + _afterHops;
+      if (n < end) return;
+      _pending.removeAt(0);
+      out.add(_measure(o, end));
+    }
   }
 
-  void _emit(List<Onset> out) {
-    out.add(Onset(t: _onsetT!, peakDb: _peak, toneDb: toDb(_low) - toDb(_high)));
-    _onsetT = null;
+  Onset _measure(int o, int end) {
+    final rises = <double>[], shape = <double>[];
+    var loud = -120.0;
+    for (var h = o; h < end; h++) {
+      loud = math.max(loud, _broad[_at(h)]);
+    }
+    for (var b = 0; b < bandCount; b++) {
+      var before = 0.0, after = 0.0;
+      for (var h = o - _beforeFrom; h < o - _beforeTo; h++) {
+        before += _raw[b][_at(h)];
+      }
+      for (var h = o; h < end; h++) {
+        after += _raw[b][_at(h)];
+      }
+      before /= _beforeFrom - _beforeTo;
+      after /= math.max(1, end - o);
+      rises.add((toDb(after) - toDb(before)).clamp(-10.0, 60.0));
+      shape.add(toDb(after));
+    }
+    // Loudness-free: subtract the mean over bands.
+    final mr = mean(rises), ms = mean(shape);
+    final features = [...rises.map((r) => r - mr), ...shape.map((s) => s - ms)];
+    final onset = Onset(t: _hopTime[_at(o)], peakDb: loud, features: features);
+    onset.toneDb = model?.score(features) ?? StrokeModel.fallback(features);
+    return onset;
+  }
+}
+
+/// Dum-versus-rim classifier learned from the player's own drum: Gaussians
+/// with a per-feature variance shared by both classes. [score] is the
+/// log-likelihood ratio, positive for dum.
+class StrokeModel {
+  StrokeModel(this.dum, this.tek, this.variance);
+
+  final List<double> dum, tek, variance;
+
+  /// Variance floor: features closer than ~2 dB are not trusted to differ.
+  static const _minVar = 4.0;
+
+  factory StrokeModel.fit(List<List<double>> dums, List<List<double>> teks) {
+    final dim = dums.first.length;
+    List<double> meanOf(List<List<double>> xs) => [for (var i = 0; i < dim; i++) mean(xs.map((x) => x[i]))];
+    final md = meanOf(dums), mt = meanOf(teks);
+    final v = List<double>.filled(dim, 0);
+    for (final (xs, m) in [(dums, md), (teks, mt)]) {
+      for (final x in xs) {
+        for (var i = 0; i < dim; i++) {
+          v[i] += (x[i] - m[i]) * (x[i] - m[i]);
+        }
+      }
+    }
+    final dof = math.max(1, dums.length + teks.length - 2);
+    return StrokeModel(md, mt, [for (final x in v) math.max(_minVar, x / dof)]);
+  }
+
+  double score(List<double> x) {
+    var s = 0.0;
+    for (var i = 0; i < x.length; i++) {
+      final dt = x[i] - tek[i], dd = x[i] - dum[i];
+      s += (dt * dt - dd * dd) / (2 * variance[i]);
+    }
+    return s;
+  }
+
+  /// Without calibration: low bands rising more than high ones means dum.
+  static double fallback(List<double> f) => (f[0] + f[1] + f[2]) / 3 - (f[5] + f[6] + f[7]) / 3;
+
+  /// Leave-one-out scores of the training strokes, showing how separable they are.
+  static (List<double>, List<double>) crossValidate(List<List<double>> dums, List<List<double>> teks) {
+    final sd = <double>[], st = <double>[];
+    for (var i = 0; i < dums.length; i++) {
+      sd.add(StrokeModel.fit([...dums]..removeAt(i), teks).score(dums[i]));
+    }
+    for (var i = 0; i < teks.length; i++) {
+      st.add(StrokeModel.fit(dums, [...teks]..removeAt(i)).score(teks[i]));
+    }
+    return (sd, st);
+  }
+
+  Map<String, dynamic> toJson() => {'dum': dum, 'tek': tek, 'var': variance};
+
+  static StrokeModel? fromJson(Object? j) {
+    if (j is! Map) return null;
+    List<double> l(Object? x) => (x as List).map((v) => (v as num).toDouble()).toList();
+    return StrokeModel(l(j['dum']), l(j['tek']), l(j['var']));
   }
 }
 
