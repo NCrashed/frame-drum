@@ -1,0 +1,197 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+import 'audio.dart';
+import 'dsp.dart';
+import 'model.dart';
+import 'pattern.dart';
+import 'scoring.dart';
+import 'synth.dart';
+
+/// Our own sounds as the mic hears them through a phone speaker are dropped
+/// unless the hit is this much louder than the calibrated level.
+const gateMarginDb = 6.0;
+
+/// Level assumed for our sounds before calibration.
+const defaultSelfLevelDb = -20.0;
+
+/// Ignores hits that coincide with sounds the app itself plays.
+class SelfSoundGate {
+  SelfSoundGate({
+    required this.intro,
+    required this.loop,
+    required this.introSeconds,
+    required this.loopSeconds,
+    required this.levels,
+  });
+
+  final List<Scheduled> intro, loop;
+  final double introSeconds, loopSeconds;
+  final Map<Voice, double> levels;
+
+  static const before = 0.010, after = 0.025;
+
+  /// Whether a hit at song time [t] with [peakDb] is probably our own sound.
+  bool isSelf(double t, double peakDb) {
+    bool near(Scheduled e, double tt) =>
+        tt - e.t >= -before && tt - e.t <= after && peakDb < (levels[e.voice] ?? defaultSelfLevelDb) + gateMarginDb;
+    if (t < introSeconds + after) {
+      if (intro.any((e) => near(e, t))) return true;
+    }
+    if (t >= introSeconds - before) {
+      final tl = (t - introSeconds) % loopSeconds;
+      for (final e in loop) {
+        if (near(e, tl) || near(e, tl + loopSeconds) || near(e, tl - loopSeconds)) return true;
+      }
+    }
+    return false;
+  }
+}
+
+enum PracticeState { idle, starting, running }
+
+class Practice extends ChangeNotifier {
+  Practice(this.store, this.pattern, {AudioIO? io}) : io = io ?? AudioIO.instance;
+
+  final Store store;
+  final Pattern pattern;
+  final AudioIO io;
+
+  PracticeState state = PracticeState.idle;
+  String? error;
+  String route = 'speaker';
+
+  Scorer? scorer;
+  OnsetDetector? _detector;
+  SelfSoundGate? _gate;
+  double _latency = 0;
+  int? _t0;
+  DateTime? _startedAt;
+  double introSeconds = 0;
+  int countInBeats = 4;
+  Hit? lastHit;
+  final _subs = <StreamSubscription<dynamic>>[];
+
+  bool get running => state == PracticeState.running;
+  double get levelDb => _detector?.levelDb ?? -120;
+
+  /// Song time (seconds since count-in start) of what is heard right now.
+  double? get now => _t0 == null ? null : (io.now() - _t0!) / 1e9;
+
+  Future<void> start() async {
+    if (state != PracticeState.idle) return;
+    state = PracticeState.starting;
+    error = null;
+    notifyListeners();
+    try {
+      if (!await io.requestMic()) {
+        throw 'Нет доступа к микрофону';
+      }
+      final info = await io.info();
+      route = info.route;
+      final s = store.settings;
+      _latency = (s.latencyMs[route] ?? 0) / 1000;
+      final synth = Synth(info.sampleRate, clickVolume: s.clickVolume, guideVolume: s.guideVolume);
+      countInBeats = pattern.beats < 3 ? pattern.beats * 2 : pattern.beats;
+      final intro = synth.countIn(pattern, countInBeats);
+      final loop = synth.loop(pattern);
+      introSeconds = intro.seconds(info.sampleRate);
+      // With headphones the mic can't hear us, so nothing to filter.
+      _gate = route == 'speaker'
+          ? SelfSoundGate(
+              intro: intro.events,
+              loop: loop.events,
+              introSeconds: introSeconds,
+              loopSeconds: loop.seconds(info.sampleRate),
+              levels: s.selfLevelDb,
+            )
+          : null;
+      _detector = OnsetDetector(sampleRate: info.sampleRate, riseDb: s.riseDb, minLevelDb: s.minLevelDb);
+      scorer = Scorer(pattern, start: introSeconds, lowThreshold: s.toneThreshold);
+      lastHit = null;
+      _t0 = null;
+      await io.syncClock();
+      _subs
+        ..add(io.clock.listen((t0) => _t0 = t0))
+        ..add(io.mic.listen(_onMic));
+      await io.startMic();
+      await io.play(intro.pcm, loop.pcm);
+      await io.keepScreenOn(true);
+      _startedAt = DateTime.now();
+      state = PracticeState.running;
+    } catch (e) {
+      error = e is PlatformException ? (e.message ?? e.code) : '$e';
+      await _teardown();
+      state = PracticeState.idle;
+    }
+    notifyListeners();
+  }
+
+  void _onMic(MicChunk c) {
+    final det = _detector, sc = scorer, t0 = _t0;
+    if (det == null || sc == null) return;
+    final onsets = det.feed(c.pcm, c.t);
+    if (t0 == null) return;
+    var changed = false;
+    for (final o in onsets) {
+      final t = (o.t - t0) / 1e9 - _latency;
+      if (_gate?.isSelf(t, o.peakDb) ?? false) continue;
+      final h = sc.addHit(t, o.toneDb, o.peakDb);
+      if (h != null) {
+        lastHit = h;
+        changed = true;
+      }
+    }
+    // Onsets are reported after their measurement window, so lag behind a bit
+    // before declaring a stroke missed.
+    final end = (c.t + c.pcm.length * 1e9 ~/ det.sampleRate - t0) / 1e9 - _latency;
+    if (sc.advance(end - 0.08).isNotEmpty) changed = true;
+    if (changed) notifyListeners();
+  }
+
+  /// Stops and stores the session; returns it if it was long enough to keep.
+  Future<Session?> stop() async {
+    if (state != PracticeState.running) return null;
+    await _teardown();
+    state = PracticeState.idle;
+    final sc = scorer!;
+    final started = _startedAt ?? DateTime.now();
+    Session? session;
+    if (sc.all.expected >= 8) {
+      session = Session(
+        patternId: pattern.id,
+        at: started,
+        bpm: pattern.bpm,
+        seconds: DateTime.now().difference(started).inSeconds,
+        sound: TallySummary.of(sc.sound),
+        silent: pattern.silentCycles > 0 ? TallySummary.of(sc.silent) : null,
+      );
+      store.addSession(session);
+    }
+    notifyListeners();
+    return session;
+  }
+
+  Future<void> _teardown() async {
+    for (final s in _subs) {
+      await s.cancel();
+    }
+    _subs.clear();
+    try {
+      await io.stopPlay();
+      await io.stopMic();
+      await io.keepScreenOn(false);
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    if (state != PracticeState.idle) _teardown();
+    super.dispose();
+  }
+}
+
+/// Silence used as the loop when only a one-shot buffer should play.
+Float32List silence(int sampleRate) => Float32List(sampleRate ~/ 10);
