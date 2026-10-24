@@ -5,51 +5,12 @@ import 'package:flutter/services.dart';
 
 import 'audio.dart';
 import 'dsp.dart';
+import 'gate.dart';
 import 'model.dart';
 import 'pattern.dart';
 import 'recorder.dart';
 import 'scoring.dart';
 import 'synth.dart';
-
-/// Our own sounds as the mic hears them through a phone speaker are dropped
-/// unless the hit is this much louder than the calibrated level.
-const gateMarginDb = 6.0;
-
-/// Level assumed for our sounds before calibration.
-const defaultSelfLevelDb = -20.0;
-
-/// Ignores hits that coincide with sounds the app itself plays.
-class SelfSoundGate {
-  SelfSoundGate({
-    required this.intro,
-    required this.loop,
-    required this.introSeconds,
-    required this.loopSeconds,
-    required this.levels,
-  });
-
-  final List<Scheduled> intro, loop;
-  final double introSeconds, loopSeconds;
-  final Map<Voice, double> levels;
-
-  static const before = 0.010, after = 0.025;
-
-  /// Whether a hit at song time [t] with [peakDb] is probably our own sound.
-  bool isSelf(double t, double peakDb) {
-    bool near(Scheduled e, double tt) =>
-        tt - e.t >= -before && tt - e.t <= after && peakDb < (levels[e.voice] ?? defaultSelfLevelDb) + gateMarginDb;
-    if (t < introSeconds + after) {
-      if (intro.any((e) => near(e, t))) return true;
-    }
-    if (t >= introSeconds - before) {
-      final tl = (t - introSeconds) % loopSeconds;
-      for (final e in loop) {
-        if (near(e, tl) || near(e, tl + loopSeconds) || near(e, tl - loopSeconds)) return true;
-      }
-    }
-    return false;
-  }
-}
 
 enum PracticeState { idle, starting, running }
 
@@ -69,6 +30,7 @@ class Practice extends ChangeNotifier {
   SessionRecorder? _recorder;
   double _latency = 0;
   final clock = PlaybackClock();
+  final _mic = MicClock();
   DateTime? _startedAt;
   double introSeconds = 0;
   int countInBeats = 4;
@@ -127,7 +89,14 @@ class Practice extends ChangeNotifier {
         // A second stroke can't come sooner than most of the shortest gap.
         minGapMs: (sc.window * 800).clamp(35, 120),
         model: s.strokeModel,
-      )..ignore = gate == null ? null : (t, peak) => clock.t0 != null && gate.isSelf(_song(t), peak);
+        notchHz: clickNotchHz,
+      );
+      if (gate != null) {
+        _detector!
+          ..provisional = ((t, peak) => clock.t0 != null && gate.nearOwnSound(_song(t), peak))
+          ..ignore = ((o) => clock.t0 != null && gate.isSelf(_song(o.t), o));
+      }
+      _mic.reset();
       lastHit = null;
       clock
         ..t0 = null
@@ -177,7 +146,8 @@ class Practice extends ChangeNotifier {
     final det = _detector, sc = scorer;
     if (det == null || sc == null) return;
     _recorder?.addChunk(c);
-    final onsets = det.feed(c.pcm, c.t);
+    final t = _mic.chunk(c.t, c.pcm.length, det.sampleRate);
+    final onsets = det.feed(c.pcm, t);
     if (clock.t0 == null) return;
     var changed = false;
     for (final o in onsets) {
@@ -199,8 +169,8 @@ class Practice extends ChangeNotifier {
     }
     // Onsets are reported after their measurement window, so lag behind a bit
     // before declaring a stroke missed.
-    final end = _song(c.t + c.pcm.length * 1000000000 ~/ det.sampleRate);
-    if (sc.advance(end - 0.08).isNotEmpty) changed = true;
+    final end = _song(t + c.pcm.length * 1000000000 ~/ det.sampleRate);
+    if (sc.advance(end - 0.16).isNotEmpty) changed = true;
     if (changed) notifyListeners();
   }
 

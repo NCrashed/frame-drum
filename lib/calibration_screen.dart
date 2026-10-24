@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
@@ -15,6 +16,10 @@ enum _Mode { listen, strokes, loopback, playAlong }
 /// Strokes recorded for the dum/tek model, alternating and starting with dum.
 const _trainStrokes = 20;
 
+/// Click level at the mic above which the click is made quieter, and the
+/// level it is brought to, dBFS.
+const maxClickDb = -12.0, targetClickDb = -20.0;
+
 class CalibrationScreen extends StatefulWidget {
   const CalibrationScreen({super.key, required this.store});
   final Store store;
@@ -30,7 +35,8 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
   int sampleRate = 48000;
   String route = 'speaker';
   String? error;
-  OnsetDetector? det;
+  OnsetDetector? det, _raw;
+  final _mic = MicClock();
   StreamSubscription<MicChunk>? _micSub;
   StreamSubscription<ClockReport>? _clockSub;
   late final Ticker _ticker;
@@ -82,8 +88,18 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
     }
   }
 
-  void _rebuildDetector() =>
-      det = OnsetDetector(sampleRate: sampleRate, riseDb: s.riseDb, minLevelDb: s.minLevelDb, model: s.strokeModel);
+  void _rebuildDetector() {
+    _mic.reset();
+    det = OnsetDetector(
+      sampleRate: sampleRate,
+      riseDb: s.riseDb,
+      minLevelDb: s.minLevelDb,
+      model: s.strokeModel,
+      notchHz: clickNotchHz,
+    );
+    // The latency test must hear the clicks themselves, so no notches here.
+    _raw = OnsetDetector(sampleRate: sampleRate, riseDb: s.riseDb, minLevelDb: s.minLevelDb);
+  }
 
   @override
   void dispose() {
@@ -98,17 +114,17 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
   }
 
   void _onMic(MicChunk c) {
-    final d = det;
-    if (d == null) return;
-    for (final o in d.feed(c.pcm, c.t)) {
-      switch (mode) {
-        case _Mode.listen:
-          break;
-        case _Mode.strokes:
-          _train.add(o);
-          if (_train.length >= _trainStrokes) _fitStrokes();
-        case _Mode.loopback || _Mode.playAlong:
-          _testOnsets.add(o);
+    final d = det, raw = _raw;
+    if (d == null || raw == null) return;
+    final t = _mic.chunk(c.t, c.pcm.length, sampleRate);
+    final testing = mode == _Mode.loopback || mode == _Mode.playAlong;
+    for (final o in raw.feed(c.pcm, t)) {
+      if (testing) _testOnsets.add(o);
+    }
+    for (final o in d.feed(c.pcm, t)) {
+      if (mode == _Mode.strokes) {
+        _train.add(o);
+        if (_train.length >= _trainStrokes) _fitStrokes();
       }
       setState(() => last = o);
     }
@@ -219,6 +235,17 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       s.latencyMs[route] = median(clicks);
       s.selfLevelDb = levels;
       latencyNote = 'Услышано ${clicks.length} из 10, разброс ${ms(stdDev(clicks))}';
+      // A click that nearly fills the mic's range buries a stroke played on
+      // it; make it quieter so that strokes stay well above it.
+      final clickPeak = [levels[Voice.click], levels[Voice.accent]].nonNulls.fold(-120.0, math.max);
+      if (clickPeak > maxClickDb) {
+        final was = s.clickVolume;
+        s.clickVolume = (was * math.pow(10, (targetClickDb - clickPeak) / 20)).clamp(0.03, 1.0);
+        latencyNote =
+            '$latencyNote. Щелчок был слишком громким для микрофона (${clickPeak.round()} дБ): '
+            'сделал его тише в ${(was / s.clickVolume).toStringAsFixed(1)} раза. Если его плохо слышно '
+            'за бубном, лучше наушники, чем громкость: громкий щелчок заглушает удары, сыгранные на нём.';
+      }
     } else {
       const beat = 60 / 80;
       final d = <double>[];

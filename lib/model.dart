@@ -161,8 +161,10 @@ class Settings {
       for (final e in (j['self'] as Map? ?? {}).entries) ?Voice.values.asNameMap()[e.key]: (e.value as num).toDouble(),
     };
     strokeModel = StrokeModel.fromJson(j['model']);
-    dumScores = nums(j['dumScores']);
-    tekScores = nums(j['tekScores']);
+    // Trained on another feature layout (an older version): record again.
+    if (strokeModel?.dum.length != OnsetDetector.featureCount) strokeModel = null;
+    dumScores = strokeModel == null ? [] : nums(j['dumScores']);
+    tekScores = strokeModel == null ? [] : nums(j['tekScores']);
     toneThreshold = strokeModel == null ? 0 : (j['tone'] as num?)?.toDouble() ?? 0;
     riseDb = (j['rise2'] as num?)?.toDouble() ?? 9;
     minLevelDb = (j['min2'] as num?)?.toDouble() ?? -55;

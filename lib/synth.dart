@@ -17,6 +17,13 @@ class Rendered {
   double seconds(int sampleRate) => pcm.length / sampleRate;
 }
 
+/// Metronome tone frequencies: high, in the top octave band (5.8–11.5 kHz),
+/// which says little about dum versus tek. The detector notches them and
+/// leaves that band out of the stroke features, so a click under a stroke
+/// changes its sound as little as possible.
+const clickHz = 7000.0, accentHz = 8500.0;
+const clickNotchHz = [clickHz, accentHz];
+
 class Synth {
   Synth(this.sampleRate, {this.clickVolume = 0.6, this.guideVolume = 0.7});
 
@@ -34,10 +41,16 @@ class Synth {
     switch (v) {
       case Voice.click:
       case Voice.accent:
-        // Short sine ping; accent is higher and a bit louder.
-        final f = v == Voice.accent ? 2600.0 : 1800.0;
+        // Short sine ping; accent is higher and a bit louder. The 4 ms fade-in
+        // keeps its spectrum narrow, so the notches in the detector remove it
+        // instead of leaving a broadband edge that looks like a stroke.
+        final f = v == Voice.accent ? accentHz : clickHz;
         final a = clickVolume * (v == Voice.accent ? 1.0 : 0.7);
-        return _gen((0.03 * sr).round(), (t) => a * math.sin(2 * math.pi * f * t) * math.exp(-t / 0.006));
+        return _gen((0.12 * sr).round(), (t) {
+          final rise = t < 0.004 ? math.pow(math.sin(math.pi / 2 * t / 0.004), 2) : 1.0;
+          final fall = t < 0.004 ? 1.0 : math.exp(-(t - 0.004) / 0.008);
+          return a * rise * fall * math.sin(2 * math.pi * f * t);
+        });
       case Voice.dum:
         // Low membrane: falling pitch plus a soft attack thump.
         var phase = 0.0;
@@ -84,8 +97,11 @@ class Synth {
         out[k] += s[i];
       }
     }
+    final noise = math.Random(1);
     for (var i = 0; i < n; i++) {
-      out[i] = out[i].clamp(-1.0, 1.0);
+      // A faint noise floor instead of digital silence: some phone speaker
+      // amplifiers power down after ~0.3 s of zeros and click when they do.
+      out[i] = (out[i] + (noise.nextDouble() - 0.5) * 4e-4).clamp(-1.0, 1.0);
     }
     return Rendered(out, events);
   }

@@ -3,13 +3,27 @@ import 'dart:typed_data';
 
 /// A detected drum hit.
 class Onset {
-  Onset({required this.t, required this.peakDb, required this.features, this.strength = 0, this.toneDb = 0});
+  Onset({
+    required this.t,
+    required this.peakDb,
+    required this.features,
+    this.bandRise = const [],
+    this.bandLevel = const [],
+    this.strength = 0,
+    this.toneDb = 0,
+  });
 
   /// Capture time in the native clock, nanoseconds.
   final int t;
 
   /// Loudest broadband hop level around the attack, dBFS.
   final double peakDb;
+
+  /// Level rise per octave band against the 20 ms before the attack, dB.
+  final List<double> bandRise;
+
+  /// Level per octave band in the 40 ms after the attack, dB.
+  final List<double> bandLevel;
 
   /// Peak of the detection function (average band rise, dB).
   final double strength;
@@ -33,6 +47,12 @@ class Biquad {
   factory Biquad.lowPass(double f, double sr, [double q = 0.7071]) {
     final w = 2 * math.pi * f / sr, c = math.cos(w), al = math.sin(w) / (2 * q), a0 = 1 + al;
     return Biquad._((1 - c) / 2 / a0, (1 - c) / a0, (1 - c) / 2 / a0, -2 * c / a0, (1 - al) / a0);
+  }
+
+  /// Narrow band-stop at [f]; [q] sets its width (f / q).
+  factory Biquad.notch(double f, double sr, [double q = 4]) {
+    final w = 2 * math.pi * f / sr, c = math.cos(w), al = math.sin(w) / (2 * q), a0 = 1 + al;
+    return Biquad._(1 / a0, -2 * c / a0, 1 / a0, -2 * c / a0, (1 - al) / a0);
   }
 
   factory Biquad.highPass(double f, double sr, [double q = 0.7071]) {
@@ -74,8 +94,23 @@ const bandEdges = [40.0, 90.0, 180.0, 360.0, 720.0, 1440.0, 2880.0, 5760.0, 1150
 /// rose against the 20 ms before the stroke (so leftover ringing of the
 /// previous dum doesn't count), and the spectral shape right after it.
 class OnsetDetector {
-  OnsetDetector({required this.sampleRate, this.riseDb = 9, this.minLevelDb = -55, this.minGapMs = 45, this.model})
-    : _hp = Biquad.highPass(30, sampleRate.toDouble()) {
+  OnsetDetector({
+    required this.sampleRate,
+    this.riseDb = 9,
+    this.minLevelDb = -55,
+    this.minGapMs = 45,
+    this.model,
+    List<double> notchHz = const [],
+  }) : _hp = Biquad.highPass(30, sampleRate.toDouble()),
+       // Two cascaded notches per frequency: our metronome tones are removed
+       // before analysis, so a click under a stroke doesn't change its sound.
+       _notches = [
+         for (final f in notchHz)
+           if (f < sampleRate * 0.45) ...[
+             Biquad.notch(f, sampleRate.toDouble()),
+             Biquad.notch(f, sampleRate.toDouble()),
+           ],
+       ] {
     final sr = sampleRate.toDouble();
     for (var b = 0; b < bandCount; b++) {
       final hi = math.min(bandEdges[b + 1], sr * 0.45);
@@ -104,24 +139,41 @@ class OnsetDetector {
   /// No new stroke within this time after the previous one.
   double minGapMs;
 
+  /// A much louder attack this soon after an onset replaces it (pre-touch, flam).
+  static const mergeMs = 100.0;
+
   /// Classifier filling [Onset.toneDb]; a fixed low-minus-high rule without it.
   StrokeModel? model;
 
-  /// Called before an onset is accepted; returning true drops it without
-  /// starting the refractory period (used to skip our own metronome clicks).
-  bool Function(int t, double peakDb)? ignore;
+  /// Called when an attack is found: true marks it as probably our own sound
+  /// (it falls on our click). Such an onset neither starts the refractory
+  /// period nor counts towards the typical stroke strength, so a stroke right
+  /// after the click is still found; [ignore] makes the final call on both.
+  bool Function(int t, double peakDb)? provisional;
+
+  /// Called with each measured onset before it is emitted; returning true
+  /// drops it and undoes its refractory period and its effect on the
+  /// adaptive threshold (used to skip our own metronome clicks).
+  bool Function(Onset onset)? ignore;
 
   static const hop = 64;
 
   /// Input magnitude counted as clipping.
   static const clipLevel = 0.98;
   static const bandCount = 8;
+
+  /// Length of [Onset.features].
+  static int get featureCount => 2 * (bandCount - featureSkip.length);
+
+  /// Bands left out of [Onset.features].
+  static var featureSkip = const {7};
   static const _weights = [0.05, 0.1, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0];
   static const _ring = 128; // hops of history (~170 ms)
   static const _beforeFrom = 18, _beforeTo = 3; // hops before the attack used as "before"
   static const _afterHops = 30; // ~40 ms used as "after"
 
   final Biquad _hp;
+  final List<Biquad> _notches;
   final _filters = <List<Biquad>>[];
   final _alpha = <double>[];
   final _lag = <int>[];
@@ -153,6 +205,9 @@ class OnsetDetector {
   var _candidatePeak = 0.0;
   int _lastOnsetHop = -1 << 30;
   double _lastOnsetStrength = 0;
+  double _lastLoud = -120;
+  (int, double, double) _prevOnset = (-1 << 30, 0, -120);
+  var _merging = false;
 
   /// Strengths of recent strokes: the threshold follows how hard the player hits.
   final _recent = <double>[];
@@ -167,6 +222,7 @@ class OnsetDetector {
 
   final _pending = <int>[]; // onset hops waiting for their "after" window
   final _pendingStrength = <double>[];
+  final _pendingProvisional = <bool>[];
 
   /// Most recent broadband level, for the input meter.
   double levelDb = -120;
@@ -176,13 +232,18 @@ class OnsetDetector {
 
   double get _hopMs => hop * 1000 / sampleRate;
 
+  int get _mergeHops => (mergeMs / _hopMs).ceil();
+
   /// Feeds samples whose first one was captured at native time [t] (ns).
   List<Onset> feed(Float32List pcm, int t) {
     final out = <Onset>[];
     final nsPerSample = 1e9 / sampleRate;
     for (var i = 0; i < pcm.length; i++) {
       if (pcm[i].abs() >= clipLevel) _accClip++;
-      final x = _hp(pcm[i]);
+      var x = _hp(pcm[i]);
+      for (final n in _notches) {
+        x = n(x);
+      }
       if (_fill == 0) _hopStart = t + (i * nsPerSample).round();
       _accBroad += x * x;
       for (var b = 0; b < bandCount; b++) {
@@ -251,11 +312,21 @@ class OnsetDetector {
         return;
       }
       _candidate = null;
-      _accept(c, n, _candidatePeak);
+      _accept(c, n, _candidatePeak, merge: _merging);
+      _merging = false;
       return;
     }
     final sinceLast = (n - _lastOnsetHop) * _hopMs;
-    if (sinceLast < minGapMs) return;
+    if (sinceLast < minGapMs) {
+      // Fingers touching the skin just before the palm: the louder main
+      // stroke may follow within a few tens of ms and should replace it.
+      if (sinceLast <= mergeMs && d >= riseDb) {
+        _candidate = n;
+        _candidatePeak = d;
+        _merging = true;
+      }
+      return;
+    }
     // Weak "attacks" are echoes, beating modes or distortion of an overloaded
     // mic: relative to how hard this player hits, and especially soon after
     // the previous stroke while it still rings.
@@ -267,7 +338,7 @@ class OnsetDetector {
     }
   }
 
-  void _accept(int cross, int now, double strength) {
+  void _accept(int cross, int now, double strength, {bool merge = false}) {
     // Attack peak in the upper bands around the crossing.
     final from = math.max(cross - 3, now - _ring + 1);
     var peakHop = cross, peak = 0.0, loud = -120.0;
@@ -286,13 +357,31 @@ class OnsetDetector {
         break;
       }
     }
-    if (ignore?.call(_hopTime[_at(onset)], loud) ?? false) return;
+    if (!merge && (provisional?.call(_hopTime[_at(onset)], loud) ?? false)) {
+      // Neither starts the refractory period nor counts as a typical stroke.
+      _pending.add(onset);
+      _pendingStrength.add(strength);
+      _pendingProvisional.add(true);
+      return;
+    }
+    if (merge) {
+      // Replace the previous onset only by a clearly louder one still pending.
+      if (loud < _lastLoud + 6 || _pending.isEmpty || _pending.last != _lastOnsetHop) return;
+      _pending.removeLast();
+      _pendingStrength.removeLast();
+      _pendingProvisional.removeLast();
+      _recent.removeLast();
+    } else {
+      _prevOnset = (_lastOnsetHop, _lastOnsetStrength, _lastLoud);
+    }
+    _lastLoud = loud;
     _lastOnsetHop = onset;
     _lastOnsetStrength = strength;
     _recent.add(strength);
     if (_recent.length > 16) _recent.removeAt(0);
     _pending.add(onset);
     _pendingStrength.add(strength);
+    _pendingProvisional.add(false);
   }
 
   /// Emits pending onsets whose "after" window is complete or cut short by
@@ -300,11 +389,26 @@ class OnsetDetector {
   void _flush(int n, List<Onset> out) {
     while (_pending.isNotEmpty) {
       final o = _pending.first;
-      final end = _pending.length > 1 ? math.min(_pending[1], o + _afterHops) : o + _afterHops;
-      if (n < end) return;
+      final last = _pending.length == 1;
+      final end = last ? o + _afterHops : math.min(_pending[1], o + _afterHops);
+      // The last onset may still be replaced by a louder main stroke.
+      if (n < end || (last && n < o + _mergeHops)) return;
       _pending.removeAt(0);
       final strength = _pendingStrength.removeAt(0);
-      out.add(_measure(o, end, strength));
+      final prov = _pendingProvisional.removeAt(0);
+      final onset = _measure(o, end, strength);
+      if (ignore?.call(onset) ?? false) {
+        if (prov) continue;
+        _recent.remove(strength);
+        if (o == _lastOnsetHop) {
+          final (hop, s, loud) = _prevOnset;
+          _lastOnsetHop = hop;
+          _lastOnsetStrength = s;
+          _lastLoud = loud;
+        }
+        continue;
+      }
+      out.add(onset);
     }
   }
 
@@ -328,9 +432,23 @@ class OnsetDetector {
       shape.add(toDb(after));
     }
     // Loudness-free: subtract the mean over bands.
-    final mr = mean(rises), ms = mean(shape);
-    final features = [...rises.map((r) => r - mr), ...shape.map((s) => s - ms)];
-    final onset = Onset(t: _hopTime[_at(o)], peakDb: loud, features: features, strength: strength);
+    // Classification skips the octave of the metronome tones (above 5.8 kHz):
+    // through a phone speaker the click dominates them, and a dum played on
+    // the click would look like a rim stroke.
+    final keep = [
+      for (var b = 0; b < bandCount; b++)
+        if (!featureSkip.contains(b)) b,
+    ];
+    final mr = mean(keep.map((b) => rises[b])), ms = mean(keep.map((b) => shape[b]));
+    final features = [for (final b in keep) rises[b] - mr, for (final b in keep) shape[b] - ms];
+    final onset = Onset(
+      t: _hopTime[_at(o)],
+      peakDb: loud,
+      features: features,
+      bandRise: rises,
+      bandLevel: shape,
+      strength: strength,
+    );
     onset.toneDb = model?.score(features) ?? StrokeModel.fallback(features);
     return onset;
   }

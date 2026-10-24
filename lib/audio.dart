@@ -116,3 +116,31 @@ class PlaybackClock {
     }
   }
 }
+
+/// Maps the mic's sample counter to native time. The HAL timestamp of each
+/// 10 ms chunk jitters by several milliseconds while the sample clock itself
+/// is steady, so the offset between them is averaged over about half a
+/// second; a jump over [jumpNs] (lost input) is taken at once.
+class MicClock {
+  MicClock({this.jumpNs = 50000000});
+
+  final int jumpNs;
+  var _samples = 0;
+  double? _offset;
+
+  void reset() {
+    _samples = 0;
+    _offset = null;
+  }
+
+  /// Smoothed native time (ns) of the first sample of a chunk of [n] samples
+  /// whose reported time is [t].
+  int chunk(int t, int n, int sampleRate) {
+    final base = _samples * 1e9 / sampleRate;
+    final off = t - base;
+    final cur = _offset;
+    _offset = cur == null || (off - cur).abs() > jumpNs ? off : cur + (off - cur) * 0.02;
+    _samples += n;
+    return (base + _offset!).round();
+  }
+}

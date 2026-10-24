@@ -49,3 +49,6 @@ app.*.map.json
 
 # Rendered screenshots
 /test_screens/out/
+
+# Debug recordings pulled from the phone.
+/recordings/

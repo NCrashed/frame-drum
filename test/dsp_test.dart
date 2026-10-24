@@ -5,7 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frame_drum/audio.dart';
 import 'package:frame_drum/dsp.dart';
 import 'package:frame_drum/pattern.dart';
-import 'package:frame_drum/practice.dart';
+import 'package:frame_drum/gate.dart';
 import 'package:frame_drum/scoring.dart';
 import 'package:frame_drum/synth.dart';
 
@@ -112,16 +112,68 @@ void main() {
       expect(detect(pcm), isEmpty);
     });
 
-    test('a stroke right after an ignored click still counts', () {
-      final pcm = Float32List(sr * 2);
-      final click = Synth(sr).sample(Voice.click);
-      for (var i = 0; i < click.length; i++) {
-        pcm[(0.5 * sr).round() + i] += 0.3 * click[i];
+    test('a dum played right on a speaker click counts, a lone click does not', () {
+      final p = presetPatterns().first..bpm = 60; // a dum on every beat
+      final synth = Synth(sr, clickVolume: 0.35); // click peaks around -15 dBFS at the mic
+      final intro = synth.countIn(p, 4), loop = synth.loop(p);
+
+      // Calibration: click level as the latency test hears it.
+      final calib = Float32List(sr * 6);
+      for (var b = 0; b < 5; b++) {
+        final s = synth.sample(Voice.click);
+        for (var i = 0; i < s.length; i++) {
+          calib[sr * (b + 1) + i] += s[i];
+        }
       }
-      DrumSim(sr).stroke(pcm, 0.52, dum: true);
-      final det = OnsetDetector(sampleRate: sr)..ignore = (t, _) => (t / 1e9 - 0.5).abs() < 0.008;
-      final found = detect(pcm, det: det);
-      expect(found.map((f) => f.$1), [closeTo(0.52, 0.003)]);
+      final clicks = detect(
+        calib,
+        det: OnsetDetector(sampleRate: sr), // the latency test listens without notches
+      );
+      expect(clicks, isNotEmpty);
+      final train = [for (var i = 0; i < 20; i++) (0.4 + i * 0.45, i.isEven)];
+      final tf = detect(
+        DrumSim(sr, seed: 7).render(10.5, train),
+        det: OnsetDetector(sampleRate: sr, notchHz: clickNotchHz),
+      );
+      final model = StrokeModel.fit(
+        [for (var i = 0; i < tf.length; i += 2) tf[i].$2.features],
+        [for (var i = 1; i < tf.length; i += 2) tf[i].$2.features],
+      );
+
+      // Session: count-in, then 8 beats; the player skips beats 3 and 6.
+      final pcm = Float32List(sr * 14);
+      void add(Float32List s, int at) {
+        for (var i = 0; i < s.length && at + i < pcm.length; i++) {
+          pcm[at + i] += s[i];
+        }
+      }
+
+      add(intro.pcm, 0);
+      add(loop.pcm, sr * 4);
+      add(loop.pcm, sr * 8);
+      final played = [
+        for (var b = 0; b < 8; b++)
+          if (b != 3 && b != 6) 4.0 + b + 0.004,
+      ];
+      final sim = DrumSim(sr, seed: 5);
+      for (final t in played) {
+        sim.stroke(pcm, t, dum: true);
+      }
+      final gate = SelfSoundGate(
+        intro: intro.events,
+        loop: loop.events,
+        introSeconds: 4,
+        loopSeconds: loop.seconds(sr),
+        levels: {
+          for (final v in [Voice.click, Voice.accent]) v: clicks.map((c) => c.$2.peakDb).reduce(math.max),
+        },
+      );
+      final det = OnsetDetector(sampleRate: sr, notchHz: clickNotchHz, model: model)
+        ..provisional = ((t, peak) => gate.nearOwnSound(t / 1e9, peak))
+        ..ignore = ((o) => gate.isSelf(o.t / 1e9, o));
+      final found = detect(pcm, det: det).where((f) => f.$1 > 3.9).toList();
+      expect(found.map((f) => f.$1), [for (final t in played) closeTo(t, 0.004)]);
+      expect(found.where((f) => f.$2.isLow(0)).length, greaterThanOrEqualTo(found.length - 1));
     });
   });
 
@@ -164,7 +216,7 @@ void main() {
   });
 
   group('self-sound gate', () {
-    test('drops clicks heard through the speaker but keeps loud hits', () {
+    test('finds our clicks by time and tells them from strokes by spectrum', () {
       final p = presetPatterns().first..bpm = 60;
       final synth = Synth(sr);
       final intro = synth.countIn(p, 4), loop = synth.loop(p);
@@ -173,13 +225,21 @@ void main() {
         loop: loop.events,
         introSeconds: intro.seconds(sr),
         loopSeconds: loop.seconds(sr),
-        levels: {Voice.click: -30, Voice.accent: -28},
+        levels: const {},
       );
-      expect(gate.isSelf(1.002, -31), isTrue); // intro click
-      expect(gate.isSelf(4.0 + 3 * 1.0 + 0.004, -31), isTrue); // loop click, later cycle
-      expect(gate.isSelf(4.0 + 8.0 + 0.003, -27), isTrue); // accent
-      expect(gate.isSelf(5.002, -10), isFalse); // drum much louder than click
-      expect(gate.isSelf(5.5, -31), isFalse); // between clicks
+      expect(gate.nearOwnSound(1.002, -31), isTrue); // intro click
+      expect(gate.nearOwnSound(4.0 + 3 * 1.0 + 0.004, -10), isTrue); // loop click, later cycle, any level
+      expect(gate.nearOwnSound(5.5, -31), isFalse); // between clicks
+
+      Onset onset(List<double> rise, List<double> level) =>
+          Onset(t: 0, peakDb: -20, features: const [], bandRise: rise, bandLevel: level);
+      final click = onset([0, 1, 0, -2, 3, 8, 30, 40], [-30, -32, -45, -60, -80, -95, -70, -50]);
+      final dum = onset([12, 15, 20, 25, 30, 40, 45, 50], [-20, -20, -24, -35, -45, -55, -60, -52]);
+      final tekOnRing = onset([0, 1, 2, 3, 20, 35, 40, 45], [-25, -27, -30, -40, -45, -50, -58, -52]);
+      expect(gate.isSelf(5.003, click), isTrue);
+      expect(gate.isSelf(5.003, dum), isFalse);
+      expect(gate.isSelf(5.003, tekOnRing), isFalse);
+      expect(gate.isSelf(5.5, click), isFalse); // not at a click time
     });
   });
 
