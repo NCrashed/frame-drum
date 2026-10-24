@@ -140,3 +140,7 @@ nix develop -c dart run tool/eval.dart recordings/*.wav
 nix develop -c dart run tool/eval.dart --cross recordings/*.wav    # leave one session out
 nix develop -c dart run tool/eval.dart --online recordings/*.wav   # learning session by session
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
