@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'calibration_screen.dart';
+import 'dsp.dart';
 import 'editor_screen.dart';
 import 'history_screen.dart';
 import 'model.dart';
@@ -116,6 +117,15 @@ class _PracticeScreenState extends State<PracticeScreen> with SingleTickerProvid
                 OffsetStrip(scorer: practice.scorer),
                 const SizedBox(height: 12),
                 _Stats(practice: practice),
+                if (practice.running && practice.overload > OnsetDetector.overloadWarning)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text(
+                      'Микрофон перегружен: удары считаются неточно. Отодвиньте телефон, отверните '
+                      'его микрофоном от бубна или смените источник в калибровке.',
+                      style: TextStyle(color: Palette.bad, fontSize: 13),
+                    ),
+                  ),
                 if (practice.clock.jumps > 0)
                   Padding(
                     padding: const EdgeInsets.only(top: 8),

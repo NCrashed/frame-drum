@@ -42,9 +42,13 @@ class AudioIO {
     });
   }
 
-  Future<({int sampleRate, String route})> info() async {
+  Future<({int sampleRate, String route, bool unprocessed})> info() async {
     final m = (await _methods.invokeMapMethod<String, dynamic>('info'))!;
-    return (sampleRate: m['sampleRate'] as int, route: m['route'] as String);
+    return (
+      sampleRate: m['sampleRate'] as int,
+      route: m['route'] as String,
+      unprocessed: m['unprocessed'] as bool? ?? false,
+    );
   }
 
   /// Aligns [now] with the native clock (best of a few round trips).
@@ -66,9 +70,10 @@ class AudioIO {
 
   Future<bool> requestMic() async => await _methods.invokeMethod<bool>('requestMic') ?? false;
 
-  Future<void> startMic() async {
+  /// [source]: "auto", "unprocessed", "voice", "camcorder" or "mic" (see AudioEngine.startMic).
+  Future<void> startMic({String source = 'auto'}) async {
     _listen();
-    await _methods.invokeMethod('startMic');
+    await _methods.invokeMethod('startMic', {'source': source});
   }
 
   Future<void> stopMic() => _methods.invokeMethod('stopMic');

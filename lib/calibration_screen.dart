@@ -35,6 +35,8 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
   StreamSubscription<ClockReport>? _clockSub;
   late final Ticker _ticker;
   final _level = ValueNotifier(-120.0);
+  final _overload = ValueNotifier(0.0);
+  bool unprocessed = false;
 
   _Mode mode = _Mode.listen;
   Onset? last;
@@ -52,7 +54,10 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
   @override
   void initState() {
     super.initState();
-    _ticker = createTicker((_) => _level.value = det?.levelDb ?? -120)..start();
+    _ticker = createTicker((_) {
+      _level.value = det?.levelDb ?? -120;
+      _overload.value = det?.overload ?? 0;
+    })..start();
     _init();
   }
 
@@ -65,10 +70,11 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       final info = await io.info();
       sampleRate = info.sampleRate;
       route = info.route;
+      unprocessed = info.unprocessed;
       _rebuildDetector();
       _micSub = io.mic.listen(_onMic);
       _clockSub = io.clock.listen(_clock.report);
-      await io.startMic();
+      await io.startMic(source: s.micSource);
       await io.keepScreenOn(true);
       if (mounted) setState(() {});
     } catch (e) {
@@ -106,6 +112,18 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
       }
       setState(() => last = o);
     }
+  }
+
+  /// Restarts capture from another Android source; the stroke model was
+  /// trained on the old one's sound, so it may need recording again.
+  Future<void> _setSource(String id) async {
+    if (id == s.micSource) return;
+    setState(() => s.micSource = id);
+    widget.store.save();
+    await io.stopMic();
+    _rebuildDetector();
+    await io.startMic(source: id);
+    if (s.toneCalibrated) setState(() => strokeNote = 'Источник сменился: запишите дум и тек заново.');
   }
 
   void _startStrokes() => setState(() {
@@ -240,13 +258,47 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
           _Section(
             title: '1. Микрофон',
             body:
-                'Положите телефон в 1–2 м от бубна микрофоном к нему. Ударьте несколько раз: каждый удар '
-                'должен давать ровно одну отметку. Если удары теряются, снизьте порог атаки; если '
-                'один удар даёт несколько отметок, поднимите его.',
+                'Большой бубен очень громкий, и микрофон телефона легко перегружается: тогда один дум '
+                'даёт несколько отметок, а следующие удары теряются. Положите телефон в 2–3 м от бубна, '
+                'ударьте дум в полную силу и следите, чтобы не появлялась надпись о перегрузке. Если она '
+                'есть, отодвиньте телефон, положите его микрофоном от бубна или попробуйте другой источник.',
             children: [
               ValueListenableBuilder(
                 valueListenable: _level,
                 builder: (_, v, _) => _Meter(levelDb: v, floorDb: s.minLevelDb),
+              ),
+              ValueListenableBuilder(
+                valueListenable: _overload,
+                builder: (_, v, _) => Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    v > OnsetDetector.overloadWarning
+                        ? 'Перегрузка: ${pct(v)} времени сигнал упирается в потолок'
+                        : 'Перегрузки нет',
+                    style: TextStyle(color: v > OnsetDetector.overloadWarning ? Palette.bad : Palette.good),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  const Text('Источник', style: TextStyle(color: Palette.muted)),
+                  for (final (id, label) in [
+                    ('auto', 'авто'),
+                    if (unprocessed) ('unprocessed', 'без обработки'),
+                    ('voice', 'распознавание'),
+                    ('camcorder', 'видеокамера'),
+                    ('mic', 'обычный'),
+                  ])
+                    ChoiceChip(
+                      label: Text(label),
+                      selected: s.micSource == id,
+                      onSelected: busy ? null : (_) => _setSource(id),
+                    ),
+                ],
               ),
               const SizedBox(height: 4),
               _SliderRow(

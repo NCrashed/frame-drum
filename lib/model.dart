@@ -127,6 +127,9 @@ class Settings {
   double riseDb = 9;
   double minLevelDb = -55;
 
+  /// Android capture source, see [AudioIO.startMic].
+  String micSource = 'auto';
+
   /// Write the mic signal of each session to a WAV file for debugging.
   bool record = false;
 
@@ -146,6 +149,7 @@ class Settings {
     'rise2': riseDb,
     'min2': minLevelDb,
     'record': record,
+    'source': micSource,
     'click': clickVolume,
     'guide': guideVolume,
   };
@@ -163,6 +167,7 @@ class Settings {
     riseDb = (j['rise2'] as num?)?.toDouble() ?? 9;
     minLevelDb = (j['min2'] as num?)?.toDouble() ?? -55;
     record = j['record'] as bool? ?? false;
+    micSource = j['source'] as String? ?? 'auto';
     clickVolume = (j['click'] as num?)?.toDouble() ?? 0.6;
     guideVolume = (j['guide'] as num?)?.toDouble() ?? 0.7;
   }

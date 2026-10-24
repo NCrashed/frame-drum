@@ -81,6 +81,9 @@ class Practice extends ChangeNotifier {
   bool get running => state == PracticeState.running;
   double get levelDb => _detector?.levelDb ?? -120;
 
+  /// Share of recent time the mic clipped, see [OnsetDetector.overload].
+  double get overload => _detector?.overload ?? 0;
+
   /// Song time (seconds since count-in start) of what is heard right now.
   double? get now => clock.t0 == null ? null : (io.now() - clock.t0!) / 1e9;
 
@@ -134,6 +137,7 @@ class Practice extends ChangeNotifier {
           ? await SessionRecorder.open(_stamp(), info.sampleRate, {
               'pattern': pattern.toJson(),
               'route': route,
+              'micSource': s.micSource,
               'latencyMs': _latency * 1000,
               'introSeconds': introSeconds,
               'settings': s.toJson(),
@@ -150,7 +154,7 @@ class Practice extends ChangeNotifier {
           }),
         )
         ..add(io.mic.listen(_onMic));
-      await io.startMic();
+      await io.startMic(source: s.micSource);
       await io.play(intro.pcm, loop.pcm);
       await io.keepScreenOn(true);
       _startedAt = DateTime.now();

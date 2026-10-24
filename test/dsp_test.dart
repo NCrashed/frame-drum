@@ -93,6 +93,20 @@ void main() {
       });
     }
 
+    test('survives an overloaded mic and reports the overload', () {
+      final hits = [for (var i = 0; i < 16; i++) (0.4 + i * 0.5, i % 4 != 3)];
+      final pcm = DrumSim(sr, seed: 3).render(hits.last.$1 + 1.5, hits, gainJitter: 0.3);
+      for (var i = 0; i < pcm.length; i++) {
+        pcm[i] = (pcm[i] * 4).clamp(-1.0, 1.0); // ~15% of samples clipped
+      }
+      final det = OnsetDetector(sampleRate: sr);
+      final found = detect(pcm, det: det);
+      final matched = hits.where((h) => found.any((f) => (f.$1 - h.$1).abs() < 0.01)).length;
+      expect(matched, greaterThanOrEqualTo(13));
+      expect(found.length - matched, lessThanOrEqualTo(3));
+      expect(det.overload, greaterThan(OnsetDetector.overloadWarning));
+    });
+
     test('ignores steady noise and quiet ticks below the level floor', () {
       final pcm = scene(2, [(0.5, Voice.tek, 0.001)], noise: 0.01);
       expect(detect(pcm), isEmpty);

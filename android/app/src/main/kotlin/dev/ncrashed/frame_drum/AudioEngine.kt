@@ -53,12 +53,21 @@ class AudioEngine(context: Context) {
         }
     }
 
-    fun startMic() {
+    val unprocessedSupported: Boolean
+        get() = audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+
+    /**
+     * Starts capture from [source]: "unprocessed", "voice" (VOICE_RECOGNITION),
+     * "camcorder", "mic", or "auto" (UNPROCESSED when supported, else VOICE_RECOGNITION).
+     * Sources differ in gain and in which physical mic they use, which matters
+     * for a loud drum that can overload the input.
+     */
+    fun startMic(source: String) {
         if (micRunning) return
         micRunning = true
         micThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            micLoop()
+            micLoop(source)
         }, "mic").apply {
             priority = Thread.MAX_PRIORITY
             start()
@@ -71,11 +80,16 @@ class AudioEngine(context: Context) {
         micThread = null
     }
 
-    private fun micLoop() {
+    private fun micLoop(name: String) {
         // UNPROCESSED skips AGC/noise suppression, which would flatten drum attacks.
         // VOICE_RECOGNITION is the next best thing: no AGC by CDD requirement.
-        val unprocessed = audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
-        val source = if (unprocessed) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.VOICE_RECOGNITION
+        val source = when (name) {
+            "voice" -> MediaRecorder.AudioSource.VOICE_RECOGNITION
+            "camcorder" -> MediaRecorder.AudioSource.CAMCORDER
+            "mic" -> MediaRecorder.AudioSource.MIC
+            "unprocessed" -> MediaRecorder.AudioSource.UNPROCESSED
+            else -> if (unprocessedSupported) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.VOICE_RECOGNITION
+        }
         val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT)
         val record = try {
             AudioRecord.Builder()

@@ -41,7 +41,11 @@ class MainActivity : FlutterActivity() {
         MethodChannel(messenger, "frame_drum/audio").setMethodCallHandler { call, result ->
             when (call.method) {
                 "info" -> result.success(
-                    mapOf("sampleRate" to audio.sampleRate, "route" to audio.outputRoute())
+                    mapOf(
+                        "sampleRate" to audio.sampleRate,
+                        "route" to audio.outputRoute(),
+                        "unprocessed" to audio.unprocessedSupported,
+                    )
                 )
                 "now" -> result.success(System.nanoTime())
                 "requestMic" -> requestMic(result)
@@ -49,7 +53,7 @@ class MainActivity : FlutterActivity() {
                     if (!hasMic()) {
                         result.error("permission", "RECORD_AUDIO not granted", null)
                     } else {
-                        audio.startMic()
+                        audio.startMic(call.argument<String>("source") ?: "auto")
                         result.success(null)
                     }
                 }

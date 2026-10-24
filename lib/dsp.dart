@@ -3,13 +3,16 @@ import 'dart:typed_data';
 
 /// A detected drum hit.
 class Onset {
-  Onset({required this.t, required this.peakDb, required this.features, this.toneDb = 0});
+  Onset({required this.t, required this.peakDb, required this.features, this.strength = 0, this.toneDb = 0});
 
   /// Capture time in the native clock, nanoseconds.
   final int t;
 
   /// Loudest broadband hop level around the attack, dBFS.
   final double peakDb;
+
+  /// Peak of the detection function (average band rise, dB).
+  final double strength;
 
   /// Spectral description of the stroke (see [OnsetDetector]).
   final List<double> features;
@@ -109,6 +112,9 @@ class OnsetDetector {
   bool Function(int t, double peakDb)? ignore;
 
   static const hop = 64;
+
+  /// Input magnitude counted as clipping.
+  static const clipLevel = 0.98;
   static const bandCount = 8;
   static const _weights = [0.05, 0.1, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0];
   static const _ring = 128; // hops of history (~170 ms)
@@ -132,6 +138,14 @@ class OnsetDetector {
   var _fill = 0;
   final _acc = Float64List(bandCount);
   var _accBroad = 0.0;
+  var _accClip = 0;
+  int _lastClipHop = -1 << 30;
+
+  /// [overload] above this means the mic clips often enough to matter.
+  static const overloadWarning = 0.01;
+
+  /// Share of recent hops with clipped samples (mic overload), 0..1.
+  double overload = 0;
   int? _hopStart;
 
   // Peak picking.
@@ -140,7 +154,19 @@ class OnsetDetector {
   int _lastOnsetHop = -1 << 30;
   double _lastOnsetStrength = 0;
 
+  /// Strengths of recent strokes: the threshold follows how hard the player hits.
+  final _recent = <double>[];
+
+  double get _typicalNeed {
+    if (_recent.length < 4) return 0;
+    final s = [..._recent]..sort();
+    // Distortion of a clipping mic looks like weak attacks, so be stricter then.
+    final clipping = _n - _lastClipHop < 20;
+    return (clipping ? 0.65 : 0.4) * s[(s.length * 0.8).floor().clamp(0, s.length - 1)];
+  }
+
   final _pending = <int>[]; // onset hops waiting for their "after" window
+  final _pendingStrength = <double>[];
 
   /// Most recent broadband level, for the input meter.
   double levelDb = -120;
@@ -155,6 +181,7 @@ class OnsetDetector {
     final out = <Onset>[];
     final nsPerSample = 1e9 / sampleRate;
     for (var i = 0; i < pcm.length; i++) {
+      if (pcm[i].abs() >= clipLevel) _accClip++;
       final x = _hp(pcm[i]);
       if (_fill == 0) _hopStart = t + (i * nsPerSample).round();
       _accBroad += x * x;
@@ -167,6 +194,7 @@ class OnsetDetector {
         _hop(_hopStart!, out);
         _fill = 0;
         _accBroad = 0;
+        _accClip = 0;
         _acc.fillRange(0, bandCount, 0);
       }
     }
@@ -189,6 +217,9 @@ class OnsetDetector {
       if (b >= 4) attack += e;
     }
     _attack[k] = attack;
+    final clipped = _accClip > 0;
+    if (clipped) _lastClipHop = n;
+    overload += ((clipped ? 1 : 0) - overload) * 0.002; // ~0.7 s
 
     // Weighted average rise of the band envelopes (after the filters settle).
     var d = 0.0;
@@ -225,9 +256,11 @@ class OnsetDetector {
     }
     final sinceLast = (n - _lastOnsetHop) * _hopMs;
     if (sinceLast < minGapMs) return;
-    // Right after a loud stroke, a weak "attack" is most likely its echo or a
-    // beating mode rather than a new stroke.
-    final need = sinceLast < 150 ? math.max(riseDb, 0.35 * _lastOnsetStrength) : riseDb;
+    // Weak "attacks" are echoes, beating modes or distortion of an overloaded
+    // mic: relative to how hard this player hits, and especially soon after
+    // the previous stroke while it still rings.
+    final mask = 0.6 * _lastOnsetStrength * math.exp(-sinceLast / 500);
+    final need = math.max(riseDb, math.max(_typicalNeed, mask));
     if (d >= need) {
       _candidate = n;
       _candidatePeak = d;
@@ -256,7 +289,10 @@ class OnsetDetector {
     if (ignore?.call(_hopTime[_at(onset)], loud) ?? false) return;
     _lastOnsetHop = onset;
     _lastOnsetStrength = strength;
+    _recent.add(strength);
+    if (_recent.length > 16) _recent.removeAt(0);
     _pending.add(onset);
+    _pendingStrength.add(strength);
   }
 
   /// Emits pending onsets whose "after" window is complete or cut short by
@@ -267,11 +303,12 @@ class OnsetDetector {
       final end = _pending.length > 1 ? math.min(_pending[1], o + _afterHops) : o + _afterHops;
       if (n < end) return;
       _pending.removeAt(0);
-      out.add(_measure(o, end));
+      final strength = _pendingStrength.removeAt(0);
+      out.add(_measure(o, end, strength));
     }
   }
 
-  Onset _measure(int o, int end) {
+  Onset _measure(int o, int end, double strength) {
     final rises = <double>[], shape = <double>[];
     var loud = -120.0;
     for (var h = o; h < end; h++) {
@@ -293,7 +330,7 @@ class OnsetDetector {
     // Loudness-free: subtract the mean over bands.
     final mr = mean(rises), ms = mean(shape);
     final features = [...rises.map((r) => r - mr), ...shape.map((s) => s - ms)];
-    final onset = Onset(t: _hopTime[_at(o)], peakDb: loud, features: features);
+    final onset = Onset(t: _hopTime[_at(o)], peakDb: loud, features: features, strength: strength);
     onset.toneDb = model?.score(features) ?? StrokeModel.fallback(features);
     return onset;
   }
