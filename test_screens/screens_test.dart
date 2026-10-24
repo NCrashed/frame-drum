@@ -11,7 +11,6 @@ import 'package:frame_drum/editor_screen.dart';
 import 'package:frame_drum/history_screen.dart';
 import 'package:frame_drum/main.dart';
 import 'package:frame_drum/model.dart';
-import 'package:frame_drum/pattern.dart';
 import 'package:frame_drum/practice.dart';
 import 'package:frame_drum/practice_screen.dart';
 import 'package:frame_drum/scoring.dart';
