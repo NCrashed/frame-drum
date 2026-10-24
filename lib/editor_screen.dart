@@ -18,6 +18,8 @@ class _EditorScreenState extends State<EditorScreen> {
   late final name = TextEditingController(text: widget.pattern.name);
   late final notation = TextEditingController(text: widget.pattern.notation);
   String? notationError;
+  late final groups = TextEditingController(text: widget.pattern.groupsText);
+  String? groupsError;
 
   Pattern get p => widget.pattern;
 
@@ -25,6 +27,7 @@ class _EditorScreenState extends State<EditorScreen> {
   void dispose() {
     name.dispose();
     notation.dispose();
+    groups.dispose();
     super.dispose();
   }
 
@@ -54,6 +57,24 @@ class _EditorScreenState extends State<EditorScreen> {
       ..stepsPerBeat = spb
       ..steps = out;
     _changed();
+  }
+
+  void _applyGroups(String s) {
+    try {
+      p.groups = Pattern.parseGroups(s);
+    } on FormatException {
+      setState(() => groupsError = 'Числа шагов через +, например 3+3+2');
+      return;
+    }
+    groupsError = null;
+    _changed();
+  }
+
+  String _groupsHelp() {
+    final sum = p.groups!.fold(0, (a, b) => a + b);
+    return sum == p.steps.length
+        ? 'Щелчок в начале каждой группы'
+        : 'Сумма групп $sum, а шагов в ритме ${p.steps.length}';
   }
 
   void _applyNotation(String s) {
@@ -135,6 +156,21 @@ class _EditorScreenState extends State<EditorScreen> {
             ),
             IconButton.outlined(onPressed: () => _setBeats(p.beats + 1), icon: const Icon(Icons.add)),
           ],
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: groups,
+          keyboardType: TextInputType.text,
+          decoration: InputDecoration(
+            labelText: 'Щелчки по группам',
+            hintText: 'например 3+3+2',
+            helperText: groupsError == null
+                ? (p.groups == null ? 'Пусто: щелчок на каждую долю' : _groupsHelp())
+                : null,
+            errorText: groupsError,
+            border: const OutlineInputBorder(),
+          ),
+          onSubmitted: _applyGroups,
         ),
         const SizedBox(height: 20),
         const Text('Нажимайте клетки: пауза → дум → тек → ка', style: TextStyle(color: Palette.muted)),

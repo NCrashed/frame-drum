@@ -55,6 +55,9 @@ typedef Labelled = ({Onset onset, double song, Stroke? truth, double offsetMs});
 
 bool noGate = false;
 
+/// Recordings made before the click moved to 7/8.5 kHz.
+bool oldClick = false;
+
 List<Labelled> run(Rec r, {required bool notch, StrokeModel? model}) {
   final s = r.settings;
   final p = r.pattern;
@@ -64,8 +67,7 @@ List<Labelled> run(Rec r, {required bool notch, StrokeModel? model}) {
   double song(int t) => (t - t0) / 1e9 - latency;
 
   final synth = Synth(r.sr);
-  final countIn = p.beats < 3 ? p.beats * 2 : p.beats;
-  final introR = synth.countIn(p, countIn), loopR = synth.loop(p);
+  final introR = synth.countIn(p), loopR = synth.loop(p);
   final levels = {
     for (final e in (s['self'] as Map? ?? {}).entries) ?Voice.values.asNameMap()[e.key]: (e.value as num).toDouble(),
   };
@@ -85,7 +87,7 @@ List<Labelled> run(Rec r, {required bool notch, StrokeModel? model}) {
     minLevelDb: (s['min2'] as num).toDouble(),
     minGapMs: (step * 0.4 * 1000).clamp(35, 120),
     model: model ?? StrokeModel.fromJson(s['model']),
-    notchHz: notch ? clickNotches : const [],
+    notchHz: oldClick ? (notch ? clickNotches : const []) : clickNotchHz,
   );
   if (gate != null && !noGate) {
     det
@@ -142,6 +144,7 @@ String pct(int a, int b) => b == 0 ? '-' : '${(100 * a / b).round()}% of $b';
 void main(List<String> args) {
   final notch = args.contains('--notch');
   noGate = args.contains('--no-gate');
+  oldClick = args.contains('--old-click');
   if (args.contains('--all-bands')) OnsetDetector.featureSkip = const {};
   final ti = args.indexOf('--train');
   final trainN = ti >= 0 ? int.parse(args[ti + 1]) : 0;
@@ -165,6 +168,58 @@ void main(List<String> args) {
     model = StrokeModel.fit(d, t);
     skip = first.isEmpty ? 0 : math.max(0, first.length);
     stdout.writeln('trained on ${d.length} dum + ${t.length} tek from ${recs.first.name}');
+  }
+  if (args.contains('--online')) {
+    // As the app learns: each session is scored with the model built from
+    // the earlier ones (the first with its stored calibration model), then
+    // its on-time strokes join the training set, at most 200 per class.
+    final samples = <Stroke, List<List<double>>>{};
+    StrokeModel? m;
+    for (final r in recs) {
+      final xs = run(r, notch: notch, model: m);
+      report('${r.name} (learned from ${samples.values.fold(0, (a, l) => a + l.length)})', xs, r);
+      final onTime = xs.where((x) => x.truth != null && x.offsetMs.abs() <= 40).toList();
+      final agree = onTime.where((x) => x.onset.isLow(0) == x.truth!.isLow).length / math.max(1, onTime.length);
+      if (agree < 0.6) {
+        stdout.writeln('  skipped for learning: labels agree with the model on ${(agree * 100).round()}%');
+        continue;
+      }
+      for (final x in onTime) {
+        final l = samples.putIfAbsent(x.truth!, () => [])..add(x.onset.features);
+        if (l.length > 200) l.removeAt(0);
+      }
+      final d = samples[Stroke.dum] ?? [], t = samples[Stroke.tek] ?? [], k = samples[Stroke.ka] ?? [];
+      if (d.length >= 3 && t.length + k.length >= 3) {
+        m = t.length < 3 ? StrokeModel.fit(d, k) : StrokeModel.fit(d, t, k);
+      }
+    }
+    return;
+  }
+  if (args.contains('--cross')) {
+    // Leave one session out: train on the strokes of all the others, which
+    // only needs features, so detect once and refit per held-out session.
+    final all = [for (final r in recs) run(r, notch: notch)];
+    for (final (i, r) in recs.indexed) {
+      final train = [
+        for (final (j, xs) in all.indexed)
+          if (j != i) ...xs.where((x) => x.truth != null && x.offsetMs.abs() < 60),
+      ];
+      final m = StrokeModel.fit(
+        [
+          for (final x in train)
+            if (x.truth!.isLow) x.onset.features,
+        ],
+        [
+          for (final x in train)
+            if (!x.truth!.isLow) x.onset.features,
+        ],
+      );
+      for (final x in all[i]) {
+        x.onset.toneDb = m.score(x.onset.features);
+      }
+      report('${r.name} (trained on ${train.length} from other sessions)', all[i], r);
+    }
+    return;
   }
   for (final (i, r) in recs.indexed) {
     var xs = run(r, notch: notch, model: model);

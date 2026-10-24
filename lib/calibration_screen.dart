@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import 'audio.dart';
 import 'dsp.dart';
 import 'model.dart';
+import 'pattern.dart';
 import 'practice.dart';
 import 'synth.dart';
 import 'theme.dart';
@@ -14,7 +15,9 @@ import 'theme.dart';
 enum _Mode { listen, strokes, loopback, playAlong }
 
 /// Strokes recorded for the dum/tek model, alternating and starting with dum.
-const _trainStrokes = 20;
+/// Calibration strokes, played round and round in this order.
+const _cycle = [Stroke.dum, Stroke.tek, Stroke.ka];
+const _trainStrokes = 21;
 
 /// Click level at the mic above which the click is made quieter, and the
 /// level it is brought to, dBFS.
@@ -139,7 +142,17 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
     await io.stopMic();
     _rebuildDetector();
     await io.startMic(source: id);
-    if (s.toneCalibrated) setState(() => strokeNote = 'Источник сменился: запишите дум и тек заново.');
+    // Another mic hears the drum differently: what was learned no longer fits.
+    s
+      ..calibSamples = {}
+      ..practiceSamples = {}
+      ..strokeModel = null
+      ..dumScores = []
+      ..tekScores = []
+      ..kaScores = [];
+    widget.store.save();
+    _rebuildDetector();
+    setState(() => strokeNote = 'Источник сменился: запишите удары заново.');
   }
 
   void _startStrokes() => setState(() {
@@ -150,20 +163,22 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
 
   void _fitStrokes() {
     mode = _Mode.listen;
-    final dums = [for (var i = 0; i < _train.length; i += 2) _train[i].features];
-    final teks = [for (var i = 1; i < _train.length; i += 2) _train[i].features];
-    final (sd, st) = StrokeModel.crossValidate(dums, teks);
-    final right = sd.where((x) => x >= 0).length + st.where((x) => x < 0).length;
+    List<List<double>> every(int k) => [for (var i = k; i < _train.length; i += _cycle.length) _train[i].features];
+    final dums = every(0), teks = every(1), kas = every(2);
+    final (sd, st, sk) = StrokeModel.crossValidate(dums, teks, kas);
+    final right = sd.where((x) => x >= 0).length + [...st, ...sk].where((x) => x < 0).length;
     s
-      ..strokeModel = StrokeModel.fit(dums, teks)
+      ..calibSamples = {Stroke.dum: dums, Stroke.tek: teks, Stroke.ka: kas}
       ..dumScores = sd
       ..tekScores = st
-      ..toneThreshold = 0;
-    final share = right / (sd.length + st.length);
+      ..kaScores = sk
+      ..toneThreshold = 0
+      ..refit();
+    final share = right / (sd.length + st.length + sk.length);
     strokeNote = share >= 0.9
-        ? 'Узнаёт ${pct(share)} ударов. Сыграйте ещё немного и посмотрите на подписи ниже.'
-        : 'Узнаёт только ${pct(share)}. Попробуйте заново: строго по очереди, начиная с дума, '
-              'без лишних касаний. Если не помогает, играйте дум ближе к центру.';
+        ? 'Узнаёт ${pct(share)} ударов. Сыграйте ещё немного и посмотрите на подписи выше.'
+        : 'Узнаёт только ${pct(share)}. Попробуйте заново: строго по кругу дум, тек, ка, '
+              'без лишних касаний. Занятия потом тоже научат модель.';
     _rebuildDetector();
     widget.store.save();
   }
@@ -357,18 +372,18 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
           ),
           const SizedBox(height: 12),
           _Section(
-            title: '2. Дум и тек',
+            title: '2. Дум, тек и ка',
             body:
-                'Сыграйте $_trainStrokes ударов строго по очереди: дум, тек, дум, тек… начиная с дума, в '
+                'Сыграйте $_trainStrokes ударов по кругу: дум, тек, ка, дум, тек, ка… начиная с дума, в '
                 'спокойном темпе, как обычно играете. Приложение научится различать их именно на вашем '
                 'бубне, в том числе когда тек звучит поверх звона дума.',
             children: [
-              _ToneChart(dum: s.dumScores, tek: s.tekScores, threshold: s.toneThreshold),
+              _ToneChart(dum: s.dumScores, tek: [...s.tekScores, ...s.kaScores], threshold: s.toneThreshold),
               const SizedBox(height: 4),
               const Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('← тек', style: TextStyle(color: Palette.rim, fontSize: 12)),
+                  Text('← тек и ка', style: TextStyle(color: Palette.rim, fontSize: 12)),
                   Text('дум →', style: TextStyle(color: Palette.brass, fontSize: 12)),
                 ],
               ),
@@ -383,10 +398,38 @@ class _CalibrationScreenState extends State<CalibrationScreen> with SingleTicker
                 icon: Icon(mode == _Mode.strokes ? Icons.mic : Icons.fiber_manual_record_outlined),
                 label: Text(
                   mode == _Mode.strokes
-                      ? 'Сейчас ${_train.length.isEven ? 'дум' : 'тек'}: ${_train.length} из $_trainStrokes'
+                      ? 'Сейчас ${_cycle[_train.length % _cycle.length].word.toLowerCase()}: ${_train.length} из $_trainStrokes'
                       : (s.toneCalibrated ? 'Записать заново' : 'Записать'),
                 ),
               ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Учиться на занятиях'),
+                subtitle: Text(
+                  'Удары, сыгранные точно в долю, дополняют калибровку: ритм подсказывает, какой это был '
+                  'удар. Сейчас запомнено ${s.practiceCount}.',
+                ),
+                value: s.learn,
+                onChanged: (v) {
+                  s.learn = v;
+                  widget.store.save();
+                },
+              ),
+              if (s.practiceCount > 0)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    onPressed: () {
+                      s
+                        ..practiceSamples = {}
+                        ..strokeModel = null
+                        ..refit();
+                      _rebuildDetector();
+                      widget.store.save();
+                    },
+                    child: const Text('Забыть выученное на занятиях'),
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),

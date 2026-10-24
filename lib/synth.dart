@@ -54,7 +54,7 @@ class Synth {
       case Voice.dum:
         // Low membrane: falling pitch plus a soft attack thump.
         var phase = 0.0;
-        return _gen((0.35 * sr).round(), (t) {
+        return _gen((0.6 * sr).round(), (t) {
           final f = 70 + 45 * math.exp(-t / 0.04);
           phase += 2 * math.pi * f / sr;
           final body = math.sin(phase) * math.exp(-t / 0.12);
@@ -78,8 +78,13 @@ class Synth {
 
   Float32List _gen(int n, double Function(double t) f) {
     final out = Float32List(n);
+    // Raised-cosine fade over the last 20 ms: a sound cut off mid-ring makes
+    // a click of its own, which the mic hears as a stroke.
+    final fade = math.min(n, (0.02 * sampleRate).round());
     for (var i = 0; i < n; i++) {
-      out[i] = f(i / sampleRate);
+      final left = n - i;
+      final g = left >= fade ? 1.0 : 0.5 - 0.5 * math.cos(math.pi * left / fade);
+      out[i] = g * f(i / sampleRate);
     }
     return out;
   }
@@ -106,11 +111,14 @@ class Synth {
     return Rendered(out, events);
   }
 
-  /// Count-in: [beats] clicks at the pattern tempo, the first accented.
-  Rendered countIn(Pattern p, int beats) {
-    final beat = 60 / p.bpm;
-    return mix(beat * beats, [
-      for (var b = 0; b < beats; b++) (t: b * beat, voice: b == 0 ? Voice.accent : Voice.click),
+  /// Count-in: the pattern's clicks for one cycle (two if that is fewer than
+  /// three clicks), the first accented.
+  Rendered countIn(Pattern p) {
+    final cycles = p.clickSteps.length < 3 ? 2 : 1;
+    return mix(p.cycleSeconds * cycles, [
+      for (var c = 0; c < cycles; c++)
+        for (final (i, s) in p.clickSteps.indexed)
+          (t: c * p.cycleSeconds + s * p.stepSeconds, voice: c == 0 && i == 0 ? Voice.accent : Voice.click),
     ]);
   }
 
@@ -122,13 +130,13 @@ class Synth {
     final events = <Scheduled>[];
     for (var c = 0; c < (silent ? p.soundCycles : 1); c++) {
       final base = c * p.cycleSeconds;
-      for (var b = 0; b < p.beats; b++) {
+      for (final (i, s) in p.clickSteps.indexed) {
         final click = switch (p.clickMode) {
-          ClickMode.beat => b == 0 ? Voice.accent : Voice.click,
-          ClickMode.cycle => b == 0 ? Voice.accent : null,
+          ClickMode.beat => i == 0 ? Voice.accent : Voice.click,
+          ClickMode.cycle => i == 0 ? Voice.accent : null,
           ClickMode.off => null,
         };
-        if (click != null) events.add((t: base + b * 60 / p.bpm, voice: click));
+        if (click != null) events.add((t: base + s * p.stepSeconds, voice: click));
       }
       if (p.guide) {
         for (var i = 0; i < p.steps.length; i++) {

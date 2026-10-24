@@ -115,7 +115,7 @@ void main() {
     test('a dum played right on a speaker click counts, a lone click does not', () {
       final p = presetPatterns().first..bpm = 60; // a dum on every beat
       final synth = Synth(sr, clickVolume: 0.35); // click peaks around -15 dBFS at the mic
-      final intro = synth.countIn(p, 4), loop = synth.loop(p);
+      final intro = synth.countIn(p), loop = synth.loop(p);
 
       // Calibration: click level as the latency test hears it.
       final calib = Float32List(sr * 6);
@@ -219,7 +219,7 @@ void main() {
     test('finds our clicks by time and tells them from strokes by spectrum', () {
       final p = presetPatterns().first..bpm = 60;
       final synth = Synth(sr);
-      final intro = synth.countIn(p, 4), loop = synth.loop(p);
+      final intro = synth.countIn(p), loop = synth.loop(p);
       final gate = SelfSoundGate(
         intro: intro.events,
         loop: loop.events,

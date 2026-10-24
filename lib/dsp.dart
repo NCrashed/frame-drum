@@ -455,62 +455,83 @@ class OnsetDetector {
 }
 
 /// Dum-versus-rim classifier learned from the player's own drum: Gaussians
-/// with a per-feature variance shared by both classes. [score] is the
-/// log-likelihood ratio, positive for dum.
+/// with a per-feature variance shared by all classes. Tek and ka are both rim
+/// strokes but of different hands, and can sound rather different, so each
+/// has its own centre. [score] is the log-likelihood ratio of dum against the
+/// closer rim stroke, positive for dum.
 class StrokeModel {
-  StrokeModel(this.dum, this.tek, this.variance);
+  StrokeModel(this.dum, this.tek, this.variance, [this.ka]);
 
   final List<double> dum, tek, variance;
+  final List<double>? ka;
 
   /// Variance floor: features closer than ~2 dB are not trusted to differ.
   static const _minVar = 4.0;
 
-  factory StrokeModel.fit(List<List<double>> dums, List<List<double>> teks) {
+  /// Fewest ka strokes for ka to get its own centre.
+  static const _minKa = 3;
+
+  factory StrokeModel.fit(List<List<double>> dums, List<List<double>> teks, [List<List<double>> kas = const []]) {
     final dim = dums.first.length;
     List<double> meanOf(List<List<double>> xs) => [for (var i = 0; i < dim; i++) mean(xs.map((x) => x[i]))];
-    final md = meanOf(dums), mt = meanOf(teks);
+    final classes = [(dums, meanOf(dums)), (teks, meanOf(teks)), if (kas.length >= _minKa) (kas, meanOf(kas))];
     final v = List<double>.filled(dim, 0);
-    for (final (xs, m) in [(dums, md), (teks, mt)]) {
+    var n = 0;
+    for (final (xs, m) in classes) {
+      n += xs.length;
       for (final x in xs) {
         for (var i = 0; i < dim; i++) {
           v[i] += (x[i] - m[i]) * (x[i] - m[i]);
         }
       }
     }
-    final dof = math.max(1, dums.length + teks.length - 2);
-    return StrokeModel(md, mt, [for (final x in v) math.max(_minVar, x / dof)]);
+    final dof = math.max(1, n - classes.length);
+    return StrokeModel(classes[0].$2, classes[1].$2, [
+      for (final x in v) math.max(_minVar, x / dof),
+    ], classes.length > 2 ? classes[2].$2 : null);
   }
 
-  double score(List<double> x) {
+  double _ll(List<double> x, List<double> m) {
     var s = 0.0;
     for (var i = 0; i < x.length; i++) {
-      final dt = x[i] - tek[i], dd = x[i] - dum[i];
-      s += (dt * dt - dd * dd) / (2 * variance[i]);
+      final d = x[i] - m[i];
+      s -= d * d / (2 * variance[i]);
     }
     return s;
   }
 
-  /// Without calibration: low bands rising more than high ones means dum.
-  static double fallback(List<double> f) => (f[0] + f[1] + f[2]) / 3 - (f[5] + f[6] + f[7]) / 3;
-
-  /// Leave-one-out scores of the training strokes, showing how separable they are.
-  static (List<double>, List<double>) crossValidate(List<List<double>> dums, List<List<double>> teks) {
-    final sd = <double>[], st = <double>[];
-    for (var i = 0; i < dums.length; i++) {
-      sd.add(StrokeModel.fit([...dums]..removeAt(i), teks).score(dums[i]));
-    }
-    for (var i = 0; i < teks.length; i++) {
-      st.add(StrokeModel.fit(dums, [...teks]..removeAt(i)).score(teks[i]));
-    }
-    return (sd, st);
+  double score(List<double> x) {
+    final k = ka;
+    final rim = k == null ? _ll(x, tek) : math.max(_ll(x, tek), _ll(x, k));
+    return _ll(x, dum) - rim;
   }
 
-  Map<String, dynamic> toJson() => {'dum': dum, 'tek': tek, 'var': variance};
+  /// Without calibration: low bands rising more than high ones means dum.
+  /// Features start with the rises of bands 0..6 (see [OnsetDetector.featureSkip]).
+  static double fallback(List<double> f) => (f[0] + f[1] + f[2]) / 3 - (f[4] + f[5] + f[6]) / 3;
+
+  /// Leave-one-out scores of the training strokes, showing how separable they are.
+  static (List<double>, List<double>, List<double>) crossValidate(
+    List<List<double>> dums,
+    List<List<double>> teks, [
+    List<List<double>> kas = const [],
+  ]) {
+    List<double> each(List<List<double>> xs, StrokeModel Function(List<List<double>> rest) fit) => [
+      for (var i = 0; i < xs.length; i++) fit([...xs]..removeAt(i)).score(xs[i]),
+    ];
+    return (
+      each(dums, (r) => StrokeModel.fit(r, teks, kas)),
+      each(teks, (r) => StrokeModel.fit(dums, r, kas)),
+      each(kas, (r) => StrokeModel.fit(dums, teks, r)),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {'dum': dum, 'tek': tek, 'var': variance, if (ka != null) 'ka': ka};
 
   static StrokeModel? fromJson(Object? j) {
     if (j is! Map) return null;
     List<double> l(Object? x) => (x as List).map((v) => (v as num).toDouble()).toList();
-    return StrokeModel(l(j['dum']), l(j['tek']), l(j['var']));
+    return StrokeModel(l(j['dum']), l(j['tek']), l(j['var']), j['ka'] == null ? null : l(j['ka']));
   }
 }
 

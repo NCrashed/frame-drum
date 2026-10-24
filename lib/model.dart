@@ -118,7 +118,16 @@ class Settings {
   StrokeModel? strokeModel;
 
   /// Leave-one-out scores of the training strokes, for the calibration chart.
-  List<double> dumScores = [], tekScores = [];
+  List<double> dumScores = [], tekScores = [], kaScores = [];
+
+  /// Stroke features by class: from calibration, and from practice hits that
+  /// landed on time (labelled by the pattern) when [learn] is on. The model
+  /// is refitted from both, so it keeps adapting to the drum and the room.
+  Map<Stroke, List<List<double>>> calibSamples = {}, practiceSamples = {};
+  bool learn = true;
+
+  /// Practice strokes kept per class (oldest dropped first).
+  static const maxPracticeSamples = 200;
 
   /// Score boundary between dum and rim strokes (0 is the model's own).
   double toneThreshold = 0;
@@ -138,12 +147,44 @@ class Settings {
 
   bool get toneCalibrated => strokeModel != null;
 
+  int get practiceCount => practiceSamples.values.fold(0, (a, l) => a + l.length);
+
+  void addPracticeSample(Stroke s, List<double> features) {
+    if (!learn || !s.isHit) return;
+    final l = practiceSamples.putIfAbsent(s, () => []);
+    l.add(features);
+    if (l.length > maxPracticeSamples) l.removeAt(0);
+  }
+
+  /// Refits [strokeModel] from calibration and practice strokes.
+  void refit() {
+    List<List<double>> all(Stroke s) => [...?calibSamples[s], ...?practiceSamples[s]];
+    final d = all(Stroke.dum), t = all(Stroke.tek), k = all(Stroke.ka);
+    if (d.length < 3 || t.length + k.length < 3) return;
+    strokeModel = t.length < 3 ? StrokeModel.fit(d, k) : StrokeModel.fit(d, t, k);
+  }
+
+  static Map<String, dynamic> _samplesToJson(Map<Stroke, List<List<double>>> m) => {
+    for (final e in m.entries) e.key.code: [for (final f in e.value) f.map((v) => (v * 10).round() / 10).toList()],
+  };
+  static Map<Stroke, List<List<double>>> _samplesFromJson(Object? j) => {
+    for (final e in (j as Map? ?? {}).entries)
+      ?Stroke.parse(e.key as String): [
+        for (final f in e.value as List)
+          if ((f as List).length == OnsetDetector.featureCount) f.map((v) => (v as num).toDouble()).toList(),
+      ],
+  };
+
   Map<String, dynamic> toJson() => {
     'latency': latencyMs,
     'self': {for (final e in selfLevelDb.entries) e.key.name: e.value},
     'model': strokeModel?.toJson(),
     'dumScores': dumScores,
     'tekScores': tekScores,
+    'kaScores': kaScores,
+    'calib': _samplesToJson(calibSamples),
+    'practice': _samplesToJson(practiceSamples),
+    'learn': learn,
     'tone': toneThreshold,
     // Keys changed with the band-based detector, so old values are not reused.
     'rise2': riseDb,
@@ -165,6 +206,11 @@ class Settings {
     if (strokeModel?.dum.length != OnsetDetector.featureCount) strokeModel = null;
     dumScores = strokeModel == null ? [] : nums(j['dumScores']);
     tekScores = strokeModel == null ? [] : nums(j['tekScores']);
+    kaScores = strokeModel == null ? [] : nums(j['kaScores']);
+    calibSamples = _samplesFromJson(j['calib']);
+    practiceSamples = _samplesFromJson(j['practice']);
+    learn = j['learn'] as bool? ?? true;
+    if (strokeModel == null) refit();
     toneThreshold = strokeModel == null ? 0 : (j['tone'] as num?)?.toDouble() ?? 0;
     riseDb = (j['rise2'] as num?)?.toDouble() ?? 9;
     minLevelDb = (j['min2'] as num?)?.toDouble() ?? -55;
@@ -196,6 +242,10 @@ class Store extends ChangeNotifier {
 
   void _fromJson(Map<String, dynamic> j) {
     final ps = (j['patterns'] as List).map((p) => Pattern.fromJson(p as Map<String, dynamic>)).toList();
+    // Malfuf from before click groups existed: click it 3+3+2.
+    for (final p in ps) {
+      if (p.id == 'preset6' && p.groups == null && p.notation == 'D--T --T-') p.groups = malfufGroups;
+    }
     final ss = (j['sessions'] as List).map((s) => Session.fromJson(s as Map<String, dynamic>)).toList();
     patterns
       ..clear()

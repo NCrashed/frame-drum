@@ -211,8 +211,9 @@ class DialPainter extends CustomPainter {
       ..drawCircle(c, ri, lane)
       ..drawCircle(c, ro, lane);
 
+    final clicks = pattern.clickSteps.toSet();
     for (var i = 0; i < n; i++) {
-      final beat = i % pattern.stepsPerBeat == 0;
+      final beat = clicks.contains(i);
       canvas.drawLine(
         at(i / n, r * (beat ? 0.83 : 0.86)),
         at(i / n, r * 0.9),
@@ -318,8 +319,10 @@ class DialPainter extends CustomPainter {
       big = '${pattern.bpm}';
       small = 'уд/мин';
     } else if (!song) {
-      final beat = 60 / pattern.bpm;
-      big = '${math.max(1, practice.countInBeats - (now / beat).floor())}';
+      // Counts down: the click just heard and those still to come.
+      final heard = practice.countInClicks.where((t) => t <= now).length;
+      final left = practice.countInClicks.length - heard + 1;
+      big = '${math.max(1, left)}';
       small = 'вступление';
     } else {
       final silent = sc.silentAt(((now - sc.start) / pattern.stepSeconds).floor());

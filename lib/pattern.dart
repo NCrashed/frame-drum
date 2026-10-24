@@ -1,6 +1,6 @@
 /// Frame drum strokes. [dum] is the open bass in the centre of the head;
 /// [tek] and [ka] are rim strokes of the strong and weak hand. Acoustically
-/// tek and ka are both "high", so the trainer only checks low vs high.
+/// tek and ka are both 'high', so the trainer only checks low vs high.
 enum Stroke {
   rest('-', '', ''),
   dum('D', 'Д', 'ДУМ'),
@@ -53,6 +53,7 @@ class Pattern {
     this.guide = false,
     this.soundCycles = 2,
     this.silentCycles = 0,
+    this.groups,
   });
 
   final String id;
@@ -72,6 +73,35 @@ class Pattern {
   /// Silent-cycle training: [soundCycles] with sound, then [silentCycles] without.
   int soundCycles;
   int silentCycles;
+
+  /// Steps per metronome click when the rhythm is felt unevenly, e.g. 3+3+2
+  /// for malfuf; null clicks every beat.
+  List<int>? groups;
+
+  /// Steps where the metronome clicks within a cycle.
+  List<int> get clickSteps {
+    final g = groups;
+    if (g == null || g.isEmpty) return [for (var b = 0; b < beats; b++) b * stepsPerBeat];
+    final out = <int>[];
+    var s = 0;
+    for (final n in g) {
+      if (s >= steps.length) break;
+      out.add(s);
+      s += n;
+    }
+    return out;
+  }
+
+  String get groupsText => groups?.join('+') ?? '';
+
+  /// Parses '3+3+2'; null for empty input, throws on anything else invalid.
+  static List<int>? parseGroups(String s) {
+    final t = s.replaceAll(' ', '');
+    if (t.isEmpty) return null;
+    final g = t.split('+').map(int.parse).toList();
+    if (g.any((n) => n < 1)) throw const FormatException('group');
+    return g;
+  }
 
   int get beats => (steps.length / stepsPerBeat).ceil();
 
@@ -110,6 +140,7 @@ class Pattern {
     'guide': guide,
     'sound': soundCycles,
     'silent': silentCycles,
+    if (groups != null) 'groups': groups,
   };
 
   factory Pattern.fromJson(Map<String, dynamic> j) => Pattern(
@@ -122,14 +153,24 @@ class Pattern {
     guide: j['guide'] as bool? ?? false,
     soundCycles: j['sound'] as int? ?? 2,
     silentCycles: j['silent'] as int? ?? 0,
+    groups: (j['groups'] as List?)?.cast<int>(),
   );
 }
+
+/// Malfuf is felt 3+3+2, not as two even beats.
+const malfufGroups = [3, 3, 2];
 
 /// Starting set: basic exercises and common Middle Eastern rhythms.
 List<Pattern> presetPatterns() {
   var n = 0;
-  Pattern p(String name, String steps, int spb, int bpm) =>
-      Pattern(id: 'preset${n++}', name: name, steps: Pattern.parseSteps(steps)!, stepsPerBeat: spb, bpm: bpm);
+  Pattern p(String name, String steps, int spb, int bpm, [List<int>? groups]) => Pattern(
+    id: 'preset${n++}',
+    name: name,
+    steps: Pattern.parseSteps(steps)!,
+    stepsPerBeat: spb,
+    bpm: bpm,
+    groups: groups,
+  );
   return [
     p('Дум на каждую долю', 'DDDD', 1, 60),
     p('Дум – тек восьмыми', 'DTDT DTDT', 2, 70),
@@ -137,7 +178,7 @@ List<Pattern> presetPatterns() {
     p('Максум', 'DT-T D-T-', 2, 80),
     p('Баляди', 'DD-T D-T-', 2, 80),
     p('Саиди', 'DT-D D-T-', 2, 80),
-    p('Мальфуф', 'D--T --T-', 4, 70),
+    p('Мальфуф', 'D--T --T-', 4, 70, malfufGroups),
     p('Шесть восьмых', 'D-T D-T', 3, 60),
   ];
 }

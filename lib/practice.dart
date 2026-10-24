@@ -12,6 +12,10 @@ import 'recorder.dart';
 import 'scoring.dart';
 import 'synth.dart';
 
+/// Share of on-time strokes whose pattern label must match the model for a
+/// session to be learned from.
+const minLearnAgreement = 0.6;
+
 enum PracticeState { idle, starting, running }
 
 class Practice extends ChangeNotifier {
@@ -31,9 +35,12 @@ class Practice extends ChangeNotifier {
   double _latency = 0;
   final clock = PlaybackClock();
   final _mic = MicClock();
+  final _onTime = <({Stroke stroke, List<double> features, bool agrees})>[];
   DateTime? _startedAt;
   double introSeconds = 0;
-  int countInBeats = 4;
+
+  /// Times of the count-in clicks, seconds from its start.
+  List<double> countInClicks = const [];
   Hit? lastHit;
 
   /// Where the last debug recording was saved.
@@ -67,8 +74,8 @@ class Practice extends ChangeNotifier {
       final s = store.settings;
       _latency = (s.latencyMs[route] ?? 0) / 1000;
       final synth = Synth(info.sampleRate, clickVolume: s.clickVolume, guideVolume: s.guideVolume);
-      countInBeats = pattern.beats < 3 ? pattern.beats * 2 : pattern.beats;
-      final intro = synth.countIn(pattern, countInBeats);
+      final intro = synth.countIn(pattern);
+      countInClicks = [for (final e in intro.events) e.t];
       final loop = synth.loop(pattern);
       introSeconds = intro.seconds(info.sampleRate);
       // With headphones the mic can't hear us, so nothing to filter.
@@ -97,6 +104,7 @@ class Practice extends ChangeNotifier {
           ..ignore = ((o) => clock.t0 != null && gate.isSelf(_song(o.t), o));
       }
       _mic.reset();
+      _onTime.clear();
       lastHit = null;
       clock
         ..t0 = null
@@ -153,6 +161,10 @@ class Practice extends ChangeNotifier {
     for (final o in onsets) {
       final t = _song(o.t);
       final h = sc.addHit(t, o.toneDb, o.peakDb);
+      // On time means the pattern says which stroke it was: learn its sound.
+      if (h?.target case final e? when h!.offsetMs.abs() <= 40) {
+        _onTime.add((stroke: e.stroke, features: o.features, agrees: h.strokeOk));
+      }
       _recorder?.addOnset({
         't': o.t,
         'song': t,
@@ -193,6 +205,7 @@ class Practice extends ChangeNotifier {
       );
       store.addSession(session);
     }
+    _learn();
     final rec = _recorder;
     _recorder = null;
     if (rec != null) {
@@ -201,6 +214,24 @@ class Practice extends ChangeNotifier {
     }
     notifyListeners();
     return session;
+  }
+
+  /// Adds this session's on-time strokes to the stroke model, unless their
+  /// labels mostly disagree with it: then the player was probably playing
+  /// something else than the pattern (started on the other stroke, say), and
+  /// learning from it would teach the model the wrong sounds.
+  void _learn() {
+    final s = store.settings;
+    final xs = [..._onTime];
+    _onTime.clear();
+    if (!s.learn || xs.length < 10) return;
+    final agree = xs.where((x) => x.agrees).length / xs.length;
+    if (s.strokeModel != null && agree < minLearnAgreement) return;
+    for (final x in xs) {
+      s.addPracticeSample(x.stroke, x.features);
+    }
+    s.refit();
+    store.save();
   }
 
   Future<void> _teardown() async {
